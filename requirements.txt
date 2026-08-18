@@ -1,0 +1,6 @@
+streamlit
+pymupdf
+python-dotenv
+pandas
+numpy
+pillow
