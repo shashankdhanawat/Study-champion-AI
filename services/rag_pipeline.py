@@ -10,7 +10,10 @@ def answer_question(chunks, query):
 
     add_embeddings(embeddings)
 
-    distances, indices = search_similar_chunks(query, index)
+    distances, indices = search_similar_chunks(
+    query,
+    index
+)
 
     relevant_chunks = get_relevant_chunks(chunks, indices)
 
