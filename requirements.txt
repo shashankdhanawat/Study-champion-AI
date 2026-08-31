@@ -4,3 +4,8 @@ python-dotenv
 pandas
 numpy
 pillow
+faiss-cpu
+sentence-transformers
+mistralai
+plotly
+SpeechRecognition

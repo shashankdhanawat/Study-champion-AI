@@ -1,4 +1,4 @@
-from utils.embedings import create_embeddings , search_similar_chunks
+from utils.embeddings import create_embeddings , search_similar_chunks
 from utils.vector_store import add_embeddings,index , get_relevant_chunks
 from utils.prompt_builder import build_prompt
 from utils.llm import ask_llm
