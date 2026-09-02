@@ -4,6 +4,10 @@ import re
 import textwrap
 from pathlib import Path
 import base64
+import random
+import sqlite3
+import hashlib
+from datetime import date, timedelta
 
 import streamlit as st
 
@@ -32,7 +36,7 @@ st.set_page_config(
 # ============================================================
 
 NAVY = "#0B1F3A"
-NAVY_LIGHT = "#12345A"
+NAVY_LIGHT = "#236ABA"
 BLUE = "#1E5AA8"
 WHITE = "#FFFFFF"
 LIGHT = "#F5F8FC"
@@ -48,6 +52,9 @@ RED = "#B42318"
 # ============================================================
 
 DEFAULT_STATE = {
+    "logged_in": False,
+    "user_id": None,
+    "username": "",
     "page": "landing",
     "chunks": [],
     "cleaned_text": "",
@@ -71,6 +78,9 @@ DEFAULT_STATE = {
     "topics_generated": False,
     "planner_created": False,
     "quiz_submitted": False,
+    "study_streak": 0,
+    "ai_summary": "",
+   
 }
 
 
@@ -78,6 +88,37 @@ for key, value in DEFAULT_STATE.items():
     if key not in st.session_state:
         st.session_state[key] = value
 
+
+DB_PATH = "study_champion.db"
+
+
+def init_auth_database():
+    conn = sqlite3.connect(DB_PATH)
+
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS study_activity (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            study_date TEXT NOT NULL,
+            UNIQUE(user_id, study_date)
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+init_auth_database()
 
 # ============================================================
 # HTML RENDER HELPER
@@ -353,7 +394,7 @@ def common_css():
         ================================================ */
 
         .section-title {{
-            color: {NAVY};
+            color: white;
 
             font-size: 28px;
 
@@ -781,6 +822,7 @@ def process_pdf(uploaded_file):
         )
 
         st.session_state.document_loaded = True
+        record_study_activity()
 
         st.success(
             f"PDF processed successfully: {uploaded_file.name}"
@@ -812,6 +854,7 @@ def process_pdf(uploaded_file):
 
 def ai_generate(prompt, system_prompt=None):
 
+
     try:
 
         result = ask_llm(
@@ -840,7 +883,61 @@ def ai_generate(prompt, system_prompt=None):
     except Exception:
 
         return ""
+    
+def generate_ai_summary():
 
+    if not st.session_state.document_loaded:
+        return ""
+
+    material = st.session_state.cleaned_text[:20000]
+
+    prompt = f"""
+You are Study Champion AI.
+
+Create a clear and useful study summary from the supplied
+study material.
+
+Use ONLY the supplied material.
+
+Create the summary in this structure:
+
+# Study Summary
+
+## Overview
+Give a short overview of the material.
+
+## Key Concepts
+List the most important concepts.
+
+## Important Points
+Explain the major points in simple language.
+
+## Exam Notes
+Give concise exam-oriented notes.
+
+## Quick Revision
+Give a short bullet-point revision section.
+
+Rules:
+- Do not invent information.
+- Do not add information not present in the material.
+- Keep the explanation student-friendly.
+- Use clear headings and bullet points.
+- Make it useful for exam revision.
+
+STUDY MATERIAL:
+{material}
+"""
+
+    response = ai_generate(
+        prompt,
+        system_prompt=(
+            "Create accurate study summaries using only "
+            "the supplied educational material."
+        )
+    )
+
+    return response.strip() if response else ""
 
 # ============================================================
 # JSON EXTRACTION
@@ -1126,7 +1223,8 @@ STUDY MATERIAL:
                 "explanation": explanation,
             }
         )
-
+    for question in valid_questions:
+        random.shuffle(question["options"])
     return valid_questions[:number_of_questions]
 
 
@@ -1282,6 +1380,216 @@ def generate_adaptive_recommendations():
 
     return recommendations
 
+# ============================================================
+# AUTHENTICATION
+# ============================================================
+
+DB_PATH = "study_champion.db"
+
+
+def init_auth_database():
+    conn = sqlite3.connect(DB_PATH)
+
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL
+        )
+        """
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def hash_password(password):
+    return hashlib.sha256(
+        password.encode("utf-8")
+    ).hexdigest()
+
+
+def register_user(username, password):
+    username = username.strip()
+
+    if not username or not password:
+        return False, "Username and password are required."
+
+    if len(password) < 6:
+        return False, "Password must contain at least 6 characters."
+
+    password_hash = hash_password(password)
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            INSERT INTO users (username, password_hash)
+            VALUES (?, ?)
+            """,
+            (username, password_hash),
+        )
+
+        conn.commit()
+        conn.close()
+
+        return True, "Account created successfully."
+
+    except sqlite3.IntegrityError:
+        return False, "Username already exists."
+
+    except Exception as exc:
+        return False, f"Registration failed: {exc}"
+
+
+def login_user(username, password):
+    username = username.strip()
+
+    password_hash = hash_password(password)
+
+    conn = sqlite3.connect(DB_PATH)
+
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        SELECT id, username
+        FROM users
+        WHERE username = ?
+        AND password_hash = ?
+        """,
+        (username, password_hash),
+    )
+
+    user = cursor.fetchone()
+
+    conn.close()
+
+    if user:
+        return True, user[0], user[1]
+
+    return False, None, None
+
+def record_study_activity():
+    user_id = st.session_state.get("user_id")
+
+    if not user_id:
+        return
+
+    today = date.today().isoformat()
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO study_activity
+            (user_id, study_date)
+            VALUES (?, ?)
+            """,
+            (user_id, today),
+        )
+
+        conn.commit()
+
+        cursor.execute(
+            """
+            SELECT study_date
+            FROM study_activity
+            WHERE user_id = ?
+            ORDER BY study_date DESC
+            """,
+            (user_id,),
+        )
+
+        activity_dates = [
+            row[0]
+            for row in cursor.fetchall()
+        ]
+
+        conn.close()
+
+        streak = 0
+        expected_date = date.today()
+
+        for activity_date in activity_dates:
+
+            current_date = date.fromisoformat(
+                activity_date
+            )
+
+            if current_date == expected_date:
+                streak += 1
+                expected_date -= timedelta(days=1)
+
+            else:
+                break
+
+        st.session_state.study_streak = streak
+
+    except Exception:
+        pass
+
+
+def get_study_streak(user_id):
+    if not user_id:
+        return 0
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT study_date
+            FROM study_activity
+            WHERE user_id = ?
+            ORDER BY study_date DESC
+            """,
+            (user_id,),
+        )
+
+        activity_dates = [
+            row[0]
+            for row in cursor.fetchall()
+        ]
+
+        conn.close()
+
+        streak = 0
+        expected_date = date.today()
+
+        for activity_date in activity_dates:
+
+            current_date = date.fromisoformat(
+                activity_date
+            )
+
+            if current_date == expected_date:
+                streak += 1
+                expected_date -= timedelta(days=1)
+
+            else:
+                break
+
+        return streak
+
+    except Exception:
+        return 0
+def logout_user():
+    st.session_state.logged_in = False
+    st.session_state.user_id = None
+    st.session_state.username = ""
+    st.session_state.page = "login"
+
+    reset_document_data()
 
 # ============================================================
 # SIDEBAR
@@ -1332,6 +1640,15 @@ def render_sidebar():
 
             st.session_state.page = "topics"
             st.rerun()
+
+        if st.button(
+          "📝  AI Summary",
+          use_container_width=True,
+          key="nav_summary",
+       ):
+
+         st.session_state.page = "summary"
+         st.rerun()
 
         # Quiz
         if st.button(
@@ -1440,6 +1757,30 @@ def render_sidebar():
             st.session_state.page = "home"
 
             st.rerun()
+        st.divider()
+
+        render_html(
+            f"""
+            <div style="
+                color:rgba(255,255,255,0.75);
+                text-align:center;
+                font-size:13px;
+                margin-bottom:10px;
+            ">
+                👤 Logged in as
+                <strong>{st.session_state.username}</strong>
+            </div>
+            """
+        )
+
+        if st.button(
+            "🚪 Logout",
+            use_container_width=True,
+            key="logout_button",
+        ):
+
+            logout_user()
+            st.rerun()
 
         if st.button(
             "←  Back to Welcome",
@@ -1463,6 +1804,151 @@ def render_sidebar():
             """
         )
 
+
+
+
+
+# ============================================================
+# LOGIN PAGE
+# ============================================================
+
+def render_login():
+
+    render_html(
+        """
+        <div style="
+            max-width:650px;
+            margin:70px auto 30px auto;
+            background:white;
+            padding:45px;
+            border-radius:25px;
+            text-align:center;
+            border:1px solid #DCE6F2;
+            box-shadow:0 15px 40px rgba(11,31,58,0.12);
+        ">
+
+            <div style="font-size:55px;">
+                🏆
+            </div>
+
+            <h1 style="
+                color:#0B1F3A;
+                margin-bottom:8px;
+            ">
+                Study Champion AI
+            </h1>
+
+            <p style="
+                color:#52647A;
+                font-size:16px;
+            ">
+                Your personal AI-powered study companion
+            </p>
+
+        </div>
+        """
+    )
+
+    login_tab, register_tab = st.tabs(
+        ["🔐 Login", "📝 Create Account"]
+    )
+
+    with login_tab:
+
+        st.subheader("Welcome Back")
+
+        username = st.text_input(
+            "Username",
+            key="login_username",
+        )
+
+        password = st.text_input(
+            "Password",
+            type="password",
+            key="login_password",
+        )
+
+        if st.button(
+            "🔐 Login",
+            use_container_width=True,
+            key="login_button",
+        ):
+
+            success, user_id, logged_username = login_user(
+                username,
+                password,
+            )
+
+            if success:
+
+                st.session_state.logged_in = True
+                st.session_state.user_id = user_id
+                st.session_state.username = logged_username
+                st.session_state.page = "landing"
+                st.session_state.study_streak = get_study_streak(user_id)
+
+                st.success(
+                    f"Welcome back, {logged_username}! 🎉"
+                )
+
+                st.rerun()
+
+            else:
+
+                st.error(
+                    "Invalid username or password."
+                )
+
+    with register_tab:
+
+        st.subheader("Create Your Account")
+
+        new_username = st.text_input(
+            "Choose a username",
+            key="register_username",
+        )
+
+        new_password = st.text_input(
+            "Create password",
+            type="password",
+            key="register_password",
+        )
+
+        confirm_password = st.text_input(
+            "Confirm password",
+            type="password",
+            key="register_confirm_password",
+        )
+
+        if st.button(
+            "📝 Create Account",
+            use_container_width=True,
+            key="register_button",
+        ):
+
+            if new_password != confirm_password:
+
+                st.error(
+                    "Passwords do not match."
+                )
+
+            else:
+
+                success, message = register_user(
+                    new_username,
+                    new_password,
+                )
+
+                if success:
+
+                    st.success(
+                        "Account created successfully! "
+                        "You can now login."
+                    )
+
+                else:
+
+                    st.error(message)
 
 # ============================================================
 # LANDING
@@ -1574,7 +2060,7 @@ def render_dashboard():
         "### 🚀 Your AI Learning Toolkit"
     )
 
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
 
     cards = [
         ("📚", "TOPICS", "Organize your study material."),
@@ -1584,7 +2070,7 @@ def render_dashboard():
     ]
 
     for column, card in zip(
-        [col1, col2, col3, col4],
+        [col1, col2, col3, col4, col5],
         cards
     ):
 
@@ -1620,7 +2106,7 @@ def render_dashboard():
         """
     )
 
-    stat1, stat2, stat3, stat4 = st.columns(4)
+    stat1, stat2, stat3, stat4, stat5 = st.columns(5)
 
     attempted = st.session_state.quiz_attempted
 
@@ -1652,10 +2138,14 @@ def render_dashboard():
             st.session_state.flashcards_reviewed,
             "Cards Reviewed"
         ),
+        (
+          f"🔥 {st.session_state.study_streak}",
+           "Study Streak"
+      ),
     ]
 
     for column, stat in zip(
-        [stat1, stat2, stat3, stat4],
+        [stat1, stat2, stat3, stat4 , stat5],
         stats
     ):
 
@@ -2049,6 +2539,7 @@ def render_quiz():
         )
 
         st.session_state.quiz_submitted = True
+        record_study_activity()
 
         st.success(
             f"Quiz completed! Score: {score}/{total}"
@@ -2248,6 +2739,7 @@ def render_flashcards():
                         st.session_state[
                             "flashcards_reviewed"
                         ] += 1
+                        record_study_activity()
 
                         st.session_state[
                             review_key
@@ -2419,6 +2911,7 @@ def render_planner():
         ):
 
             st.session_state.study_minutes += 30
+            record_study_activity()
 
             st.success(
                 "30 minutes added to your progress."
@@ -2525,7 +3018,95 @@ def render_adaptive():
             "then click Analyze My Learning."
         )
 
+def render_summary():
 
+    render_html(
+        """
+        <div class="section-title">
+            📝 AI Study Summary
+        </div>
+        """
+    )
+
+    if not st.session_state.document_loaded:
+
+        st.info(
+            "Upload a PDF from Dashboard first."
+        )
+
+        return
+
+    st.write(
+        f"Current document: "
+        f"**{st.session_state.file_name}**"
+    )
+
+    if st.button(
+        "✨ Generate AI Summary",
+        use_container_width=True,
+        key="generate_ai_summary",
+    ):
+
+        with st.spinner(
+            "AI is creating your study summary..."
+        ):
+
+            summary = generate_ai_summary()
+
+        if summary:
+
+            st.session_state.ai_summary = summary
+
+            record_study_activity()
+
+            st.success(
+                "AI summary generated successfully! 🎉"
+            )
+
+        else:
+
+            st.error(
+                "Could not generate the summary. "
+                "Please try again."
+            )
+
+    if st.session_state.ai_summary:
+
+        render_html(
+            """
+            <div class="section-title">
+                📖 Your AI Summary
+            </div>
+            """
+        )
+
+        st.markdown(
+            st.session_state.ai_summary
+        )
+
+        st.divider()
+
+        st.subheader(
+            "📥 Download Summary Notes"
+        )
+
+        st.download_button(
+            label="📄 Download as TXT",
+            data=st.session_state.ai_summary,
+            file_name="study_champion_summary.txt",
+            mime="text/plain",
+            use_container_width=True,
+            key="download_summary_txt",
+        )
+
+        st.download_button(
+            label="📝 Download as Markdown",
+            data=st.session_state.ai_summary,
+            file_name="study_champion_summary.md",
+            mime="text/markdown",
+            use_container_width=True,
+            key="download_summary_md",
+        )
 # ============================================================
 # PROGRESS
 # ============================================================
@@ -2774,55 +3355,72 @@ def render_ai_chat():
         )
 
 
-# ============================================================
-# APPLICATION
-# ============================================================
+
 
 common_css()
 
+# ============================================================
+# APPLICATION ROUTING
+# ============================================================
 
-if st.session_state.page == "landing":
+if not st.session_state.logged_in:
 
-    render_landing()
+    st.session_state.page = "login"
+
+    render_login()
 
 else:
 
-    render_sidebar()
+    if st.session_state.page == "login":
 
-    if st.session_state.page == "home":
+        st.session_state.page = "landing"
+        st.rerun()
 
-        render_dashboard()
+    elif st.session_state.page == "landing":
 
-        st.divider()
-
-        render_ai_chat()
-
-    elif st.session_state.page == "topics":
-
-        render_topics()
-
-    elif st.session_state.page == "quiz":
-
-        render_quiz()
-
-    elif st.session_state.page == "flashcards":
-
-        render_flashcards()
-
-    elif st.session_state.page == "planner":
-
-        render_planner()
-
-    elif st.session_state.page == "adaptive":
-
-        render_adaptive()
-
-    elif st.session_state.page == "progress":
-
-        render_progress()
+        render_landing()
 
     else:
 
-        st.session_state.page = "home"
+        render_sidebar()
 
-        st.rerun()
+        if st.session_state.page == "home":
+
+            render_dashboard()
+
+            st.divider()
+
+            render_ai_chat()
+
+        elif st.session_state.page == "topics":
+
+            render_topics()
+
+        elif st.session_state.page == "summary":
+
+         render_summary()
+         
+        elif st.session_state.page == "quiz":
+
+            render_quiz()
+
+        elif st.session_state.page == "flashcards":
+
+            render_flashcards()
+
+        elif st.session_state.page == "planner":
+
+            render_planner()
+
+        elif st.session_state.page == "adaptive":
+
+            render_adaptive()
+
+        elif st.session_state.page == "progress":
+
+            render_progress()
+
+        else:
+
+            st.session_state.page = "home"
+            st.rerun()
