@@ -1,5 +1,72 @@
-venv/
+# =========================
+# Python
+# =========================
 __pycache__/
+*.py[cod]
+*.pyo
+
+# =========================
+# Virtual Environment
+# =========================
+venv/
+.venv/
+env/
+
+# =========================
+# Environment / Secrets
+# =========================
 .env
+.env.*
+!.env.example
+
+# =========================
+# Streamlit Secrets
+# =========================
+.streamlit/secrets.toml
+
+# =========================
+# VS Code / OS
+# =========================
+.vscode/
+.idea/
 .DS_Store
-xy.txt/
+
+# =========================
+# Cache
+# =========================
+.cache/
+.ipynb_checkpoints/
+
+# =========================
+# Temporary Files
+# =========================
+temp/
+tmp/
+*.tmp
+*.log
+
+# =========================
+# Temporary Documents
+# =========================
+temp_*.pdf
+temp_*.docx
+
+# =========================
+# Test Files
+# =========================
+test_file.py
+test_llm.py
+test_rag.py
+test_rag_pipeline.py
+
+# =========================
+# Random / Local Files
+# =========================
+xy.txt
+
+# =========================
+# Build Files
+# =========================
+build/
+dist/
+*.egg-info/
