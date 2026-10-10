@@ -9,3 +9,4 @@ sentence-transformers
 mistralai
 plotly
 SpeechRecognition
+openai
