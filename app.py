@@ -1,12 +1,13 @@
-import os
 import json
+import math
 import re
 import textwrap
-from pathlib import Path
 import base64
 import random
 import sqlite3
 import hashlib
+import html as html_lib
+from pathlib import Path
 from datetime import date, timedelta
 
 import streamlit as st
@@ -32,19 +33,58 @@ st.set_page_config(
 
 
 # ============================================================
-# COLORS
+# DESIGN TOKENS
+# ------------------------------------------------------------
+# Highlighter-and-notebook look:
+#   ink indigo  -> structure
+#   blue        -> actions
+#   highlighter -> "you are here" / "this matters"
 # ============================================================
 
-NAVY = "#0B1F3A"
-NAVY_LIGHT = "#236ABA"
-BLUE = "#1E5AA8"
-WHITE = "#FFFFFF"
-LIGHT = "#F5F8FC"
-TEXT = "#0B1F3A"
-MUTED = "#52647A"
-BORDER = "#DCE6F2"
-GREEN = "#176B35"
-RED = "#B42318"
+PALETTES = {
+    "light": {
+        "ink": "#0F2A3F",        # dark surfaces: sidebar, banners
+        "blue": "#0B6E99",       # buttons and fills
+        "blue_text": "#0B6E99",  # accent text
+        "blue_soft": "#E3F1F8",
+        "hl": "#FFC93C",         # highlighter
+        "on_hl": "#0F2A3F",      # text on the highlighter
+        "paper": "#F5F8FA",
+        "card": "#FFFFFF",
+        "line": "#DCE6EC",
+        "text": "#12222F",
+        "heading": "#0F2A3F",
+        "muted": "#526979",
+        "good": "#13855E",
+        "good_soft": "#E1F5EC",
+        "bad": "#D6384A",
+        "bad_soft": "#FDE9EC",
+        "edge": "#0F2A3F",       # hard "pressed" shadows
+        "landing": "#0F2A3F",
+    },
+    "dark": {
+        "ink": "#13354F",
+        "blue": "#0F7DAE",
+        "blue_text": "#7CCBF0",
+        "blue_soft": "#17394F",
+        "hl": "#FFC93C",
+        "on_hl": "#0F2A3F",
+        "paper": "#0B1722",
+        "card": "#102536",
+        "line": "#24455C",
+        "text": "#E3ECF2",
+        "heading": "#F1F6F9",
+        "muted": "#9DB3C2",
+        "good": "#34B27F",
+        "good_soft": "#103426",
+        "bad": "#F26B78",
+        "bad_soft": "#3A1C25",
+        "edge": "#050D14",
+        "landing": "#07111A",
+    },
+}
+
+DB_PATH = "study_champion.db"
 
 
 # ============================================================
@@ -80,21 +120,135 @@ DEFAULT_STATE = {
     "quiz_submitted": False,
     "study_streak": 0,
     "ai_summary": "",
-   
+    "quiz_id": 0,
+    "flashcard_id": 0,
+    "fc_index": 0,
+    "fc_show": False,
+    "dark_mode": False,
 }
-
 
 for key, value in DEFAULT_STATE.items():
     if key not in st.session_state:
         st.session_state[key] = value
 
 
-DB_PATH = "study_champion.db"
+# ============================================================
+# SMALL HELPERS
+# ============================================================
 
+def esc(value):
+    """Escape any text (user or AI generated) before placing it in HTML."""
+    return html_lib.escape(str(value))
+
+
+def render_html(html):
+    """Render custom HTML through one place (dedented, trimmed)."""
+    cleaned_html = textwrap.dedent(html).strip()
+
+    try:
+        st.html(cleaned_html)
+    except AttributeError:
+        st.markdown(cleaned_html, unsafe_allow_html=True)
+
+
+def go(page, **state):
+    """Navigate to a page, optionally setting session values first."""
+    for key, value in state.items():
+        st.session_state[key] = value
+    st.session_state.page = page
+    st.rerun()
+
+
+def page_header(icon, title, subtitle=""):
+    sub = f'<p class="page-sub">{esc(subtitle)}</p>' if subtitle else ""
+    render_html(
+        f"""
+        <div class="page-head">
+            <div class="page-head-icon">{icon}</div>
+            <div>
+                <h1 class="page-title">{esc(title)}</h1>
+                {sub}
+            </div>
+        </div>
+        """
+    )
+
+
+def section_title(text):
+    render_html(f'<h2 class="section-title">{text}</h2>')
+
+
+def need_document():
+    """Shared empty state for pages that need a PDF."""
+    render_html(
+        """
+        <div class="empty">
+            <div class="empty-icon">📄</div>
+            <h3>No study material yet</h3>
+            <p>Upload a PDF on the Dashboard and this page will
+            fill up with content from it.</p>
+        </div>
+        """
+    )
+    if st.button(
+        "Go to Dashboard",
+        key=f"empty_go_{st.session_state.page}",
+        type="primary",
+    ):
+        go("home")
+
+
+def accuracy_percent():
+    attempted = st.session_state.quiz_attempted
+    if attempted <= 0:
+        return 0
+    return round((st.session_state.correct_answers / attempted) * 100)
+
+
+def ring_svg(percent, size=150):
+    """Circular progress ring as inline SVG (colours follow the theme)."""
+    radius = 52
+    circumference = 2 * math.pi * radius
+    dash = circumference * max(0, min(percent, 100)) / 100
+
+    return f"""
+    <svg width="{size}" height="{size}" viewBox="0 0 120 120"
+         role="img" aria-label="{percent} percent">
+        <circle cx="60" cy="60" r="{radius}" fill="none"
+                style="stroke: var(--line)" stroke-width="12"/>
+        <circle cx="60" cy="60" r="{radius}" fill="none"
+                style="stroke: var(--blue-text)" stroke-width="12"
+                stroke-linecap="round"
+                stroke-dasharray="{dash:.1f} {circumference:.1f}"
+                transform="rotate(-90 60 60)"/>
+        <text x="60" y="68" text-anchor="middle"
+              font-family="Bricolage Grotesque, sans-serif"
+              font-weight="800" font-size="28"
+              style="fill: var(--heading)">{percent}%</text>
+    </svg>
+    """
+
+
+def learning_level():
+    """Return (label, one-line description) from quiz accuracy."""
+    if st.session_state.quiz_attempted == 0:
+        return "Not started", "Take a quiz to find out where you stand."
+
+    accuracy = accuracy_percent()
+
+    if accuracy >= 75:
+        return "Strong", "You know this material well. Try harder questions."
+    if accuracy >= 50:
+        return "Developing", "You're getting there. Keep practicing weak spots."
+    return "Building basics", "Start with the fundamentals, then retry the quiz."
+
+
+# ============================================================
+# DATABASE / AUTH
+# ============================================================
 
 def init_auth_database():
     conn = sqlite3.connect(DB_PATH)
-
     cursor = conn.cursor()
 
     cursor.execute(
@@ -118,603 +272,721 @@ def init_auth_database():
     )
     conn.commit()
     conn.close()
+
+
 init_auth_database()
 
-# ============================================================
-# HTML RENDER HELPER
-# ============================================================
 
-def render_html(html):
-    """
-    Safely render HTML using textwrap.dedent.
+def hash_password(password):
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
-    IMPORTANT:
-    All custom HTML in this application goes through this function.
-    """
 
-    cleaned_html = textwrap.dedent(html).strip()
+def register_user(username, password):
+    username = username.strip()
+
+    if not username or not password:
+        return False, "Username and password are required."
+
+    if len(password) < 6:
+        return False, "Password must contain at least 6 characters."
 
     try:
-        # Modern Streamlit HTML renderer
-        st.html(cleaned_html)
-    except AttributeError:
-        # Compatibility fallback for older Streamlit versions
-        st.markdown(
-            cleaned_html,
-            unsafe_allow_html=True,
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO users (username, password_hash) VALUES (?, ?)",
+            (username, hash_password(password)),
         )
+        conn.commit()
+        conn.close()
+        return True, "Account created successfully."
+
+    except sqlite3.IntegrityError:
+        return False, "That username is already taken."
+
+    except Exception as exc:
+        return False, f"Registration failed: {exc}"
 
 
-# ============================================================
-# BACKGROUND
-# ============================================================
+def login_user(username, password):
+    username = username.strip()
 
-def set_background(image_path):
-    """
-    Set landing page background if image exists.
-    """
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT id, username
+        FROM users
+        WHERE username = ? AND password_hash = ?
+        """,
+        (username, hash_password(password)),
+    )
+    user = cursor.fetchone()
+    conn.close()
 
-    image_path = Path(image_path)
+    if user:
+        return True, user[0], user[1]
 
-    if not image_path.exists():
+    return False, None, None
+
+
+def _activity_dates(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT study_date FROM study_activity
+        WHERE user_id = ? ORDER BY study_date DESC
+        """,
+        (user_id,),
+    )
+    dates = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    return dates
+
+
+def _calculate_streak(user_id):
+    streak = 0
+    expected_date = date.today()
+
+    for activity_date in _activity_dates(user_id):
+        if date.fromisoformat(activity_date) == expected_date:
+            streak += 1
+            expected_date -= timedelta(days=1)
+        else:
+            break
+
+    return streak
+
+
+def record_study_activity():
+    user_id = st.session_state.get("user_id")
+    if not user_id:
         return
 
     try:
-        image_data = base64.b64encode(
-            image_path.read_bytes()
-        ).decode("utf-8")
-
-        render_html(
-            f"""
-            <style>
-                [data-testid="stAppViewContainer"] {{
-                    background:
-                        linear-gradient(
-                            rgba(11, 31, 58, 0.88),
-                            rgba(11, 31, 58, 0.94)
-                        ),
-                        url("data:image/jpeg;base64,{image_data}");
-
-                    background-size: cover;
-                    background-position: center;
-                    background-attachment: fixed;
-                }}
-
-                [data-testid="stHeader"] {{
-                    background: transparent;
-                }}
-            </style>
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
             """
+            INSERT OR IGNORE INTO study_activity (user_id, study_date)
+            VALUES (?, ?)
+            """,
+            (user_id, date.today().isoformat()),
         )
+        conn.commit()
+        conn.close()
+
+        st.session_state.study_streak = _calculate_streak(user_id)
 
     except Exception:
         pass
+
+
+def get_study_streak(user_id):
+    if not user_id:
+        return 0
+    try:
+        return _calculate_streak(user_id)
+    except Exception:
+        return 0
+
+
+def get_week_activity(user_id):
+    """Return a set of ISO dates studied in the last 7 days."""
+    if not user_id:
+        return set()
+    try:
+        cutoff = (date.today() - timedelta(days=6)).isoformat()
+        return {d for d in _activity_dates(user_id) if d >= cutoff}
+    except Exception:
+        return set()
+
+
+def logout_user():
+    st.session_state.logged_in = False
+    st.session_state.user_id = None
+    st.session_state.username = ""
+    st.session_state.page = "login"
+    reset_document_data()
 
 
 # ============================================================
 # GLOBAL CSS
 # ============================================================
 
+DARK_EXTRA_CSS = """
+    /* ---------- Dark mode: native Streamlit widgets ---------- */
+    [data-testid="stApp"] { color: var(--text); }
+
+    [data-testid="stHeader"] button,
+    [data-testid="stHeader"] svg { color: var(--text) !important; }
+
+    [data-baseweb="input"], [data-baseweb="base-input"],
+    [data-baseweb="select"] > div, [data-baseweb="textarea"] {
+        background: var(--card) !important;
+        border-color: var(--line) !important;
+    }
+    input, textarea {
+        background: var(--card) !important;
+        color: var(--text) !important;
+        -webkit-text-fill-color: var(--text) !important;
+    }
+    [data-baseweb="select"] * { color: var(--text) !important; }
+    [data-baseweb="select"] svg { fill: var(--muted) !important; }
+
+    [data-baseweb="popover"] > div,
+    [data-baseweb="menu"],
+    ul[role="listbox"] {
+        background: var(--card) !important;
+        color: var(--text) !important;
+    }
+    li[role="option"] { color: var(--text) !important; }
+    li[role="option"]:hover { background: var(--blue-soft) !important; }
+
+    [data-testid="stAlert"] {
+        background: var(--card) !important;
+        border: 1.5px solid var(--line);
+        border-radius: 12px;
+    }
+    [data-testid="stAlert"] * { color: var(--text) !important; }
+
+    [data-testid="stMetricLabel"] * { color: var(--muted) !important; }
+
+    [data-testid="stExpander"] details,
+    [data-testid="stExpander"] summary { background: var(--card); }
+    [data-testid="stExpander"] summary * { color: var(--text) !important; }
+
+    [data-testid="stVerticalBlockBorderWrapper"] { border-color: var(--line); }
+
+    [data-testid="stFileUploaderDropzone"] { background: var(--card); }
+    [data-testid="stFileUploaderDropzone"] *,
+    [data-testid="stFileUploaderFile"] * { color: var(--text); }
+
+    [data-testid="stTabs"] [role="tab"] { color: var(--muted); }
+    [data-testid="stTabs"] [role="tab"][aria-selected="true"] { color: var(--blue-text); }
+
+    [data-testid="stBottom"],
+    [data-testid="stBottomBlockContainer"] { background: var(--paper) !important; }
+    [data-testid="stChatInput"] { background: var(--card) !important; }
+
+    [data-testid="stCaptionContainer"] * { color: var(--muted) !important; }
+    [data-testid="stMainBlockContainer"] hr { border-color: var(--line); }
+    code { background: var(--blue-soft) !important; color: var(--text) !important; }
+"""
+
+
+def _sync_theme():
+    st.session_state.dark_mode = st.session_state.dark_toggle
+
+
+def render_theme_toggle():
+    """Light / dark switch. Rendered once per page."""
+    st.toggle(
+        "🌙 Dark mode",
+        value=st.session_state.dark_mode,
+        key="dark_toggle",
+        on_change=_sync_theme,
+    )
+
+
 def common_css():
+    dark = bool(st.session_state.get("dark_mode", False))
+    palette = PALETTES["dark" if dark else "light"]
 
+    variables = "\n".join(
+        f"        --{name.replace('_', '-')}: {value};"
+        for name, value in palette.items()
+    )
+
+    tokens = f"""
+    :root {{
+{variables}
+        color-scheme: {"dark" if dark else "light"};
+    }}
+    """
+
+    css = """
+    @import url('https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=Figtree:wght@400;500;600;700&display=swap');
+
+    /* ---------- Base ---------- */
+    html, body, [data-testid="stApp"], .stApp {
+        font-family: 'Figtree', system-ui, sans-serif;
+    }
+
+    /* flat paper background */
+    [data-testid="stAppViewContainer"] {
+        background: var(--paper);
+    }
+
+    [data-testid="stHeader"] { background: transparent; }
+
+    [data-testid="stMainBlockContainer"] {
+        max-width: 1180px;
+        padding-top: 28px;
+        padding-bottom: 80px;
+    }
+
+    [data-testid="stMainBlockContainer"] p,
+    [data-testid="stMainBlockContainer"] li,
+    [data-testid="stMainBlockContainer"] label,
+    [data-testid="stMainBlockContainer"] span {
+        color: var(--text);
+    }
+
+    [data-testid="stMainBlockContainer"] h1,
+    [data-testid="stMainBlockContainer"] h2,
+    [data-testid="stMainBlockContainer"] h3 {
+        font-family: 'Bricolage Grotesque', 'Figtree', sans-serif;
+        color: var(--heading);
+        letter-spacing: -0.02em;
+    }
+
+    /* ---------- Sidebar ---------- */
+    [data-testid="stSidebar"] {
+        background: var(--ink);
+        border-right: none;
+    }
+
+    [data-testid="stSidebar"] * { color: #E8F0F5; }
+
+    [data-testid="stSidebar"] hr {
+        border-color: rgba(255,255,255,0.12);
+        margin: 14px 0;
+    }
+
+    [data-testid="stSidebar"] div.stButton { margin-bottom: 2px; }
+
+    [data-testid="stSidebar"] div.stButton > button {
+        width: 100%;
+        min-height: 44px;
+        justify-content: flex-start;
+        padding: 0 14px;
+        border-radius: 10px;
+        background: transparent;
+        border: 1px solid transparent;
+        font-weight: 600;
+        font-size: 15px;
+        box-shadow: none;
+        transform: none;
+    }
+
+    [data-testid="stSidebar"] div.stButton > button:hover {
+        background: rgba(255,255,255,0.09);
+        border-color: transparent;
+        color: #fff;
+    }
+
+    /* active page = highlighter swipe */
+    [data-testid="stSidebar"] button[kind="primary"],
+    [data-testid="stSidebar"] button[data-testid="stBaseButton-primary"] {
+        background: var(--hl) !important;
+        border-color: var(--hl) !important;
+        box-shadow: none !important;
+    }
+    [data-testid="stSidebar"] button[kind="primary"] *,
+    [data-testid="stSidebar"] button[data-testid="stBaseButton-primary"] * {
+        color: var(--on-hl) !important;
+        font-weight: 700;
+    }
+
+    .brand { display: flex; align-items: center; gap: 12px; padding: 6px 4px 4px 4px; }
+    .brand-mark {
+        width: 44px; height: 44px; border-radius: 12px;
+        background: var(--hl);
+        display: grid; place-items: center; font-size: 24px;
+    }
+    .brand-name {
+        font-family: 'Bricolage Grotesque', sans-serif;
+        font-weight: 800; font-size: 19px; line-height: 1.1; color: #fff;
+    }
+    .brand-tag { font-size: 12.5px; color: #9DB6C7; }
+
+    .doc-chip {
+        background: rgba(255,255,255,0.08);
+        border-radius: 10px; padding: 11px 13px; margin: 4px 0 12px 0;
+    }
+    .doc-chip small { color: #9DB6C7; font-size: 12px; }
+    .doc-chip div { color: #fff; font-weight: 600; font-size: 14px; word-break: break-word; margin-top: 2px; }
+
+    .user-line { text-align: center; font-size: 13.5px; color: #C3D4E0; margin: 4px 0 10px 0; }
+    .user-line strong { color: #fff; }
+    .version { text-align: center; font-size: 12px; color: #7F99AB; margin-top: 16px; }
+
+    /* ---------- Buttons ---------- */
+    div.stButton > button,
+    div.stDownloadButton > button {
+        border-radius: 10px;
+        min-height: 46px;
+        font-weight: 700;
+        background: var(--card);
+        color: var(--heading);
+        border: 1.5px solid var(--line);
+        transition: background .15s ease, border-color .15s ease, transform .08s ease;
+    }
+    div.stButton > button:hover,
+    div.stDownloadButton > button:hover {
+        border-color: var(--blue);
+        color: var(--blue-text);
+        background: var(--blue-soft);
+    }
+    div.stButton > button:focus-visible,
+    div.stDownloadButton > button:focus-visible {
+        outline: 3px solid var(--hl);
+        outline-offset: 2px;
+    }
+    div.stButton > button:disabled { opacity: .45; }
+
+    /* primary = blue with a hard ink underline, like a pressed key */
+    [data-testid="stMainBlockContainer"] button[kind="primary"],
+    [data-testid="stMainBlockContainer"] button[data-testid="stBaseButton-primary"] {
+        background: var(--blue);
+        border-color: var(--edge);
+        box-shadow: 0 3px 0 var(--edge);
+    }
+    [data-testid="stMainBlockContainer"] button[kind="primary"] *,
+    [data-testid="stMainBlockContainer"] button[data-testid="stBaseButton-primary"] * {
+        color: #fff !important;
+    }
+    [data-testid="stMainBlockContainer"] button[kind="primary"]:hover,
+    [data-testid="stMainBlockContainer"] button[data-testid="stBaseButton-primary"]:hover {
+        background: var(--ink);
+    }
+    [data-testid="stMainBlockContainer"] button[kind="primary"]:active,
+    [data-testid="stMainBlockContainer"] button[data-testid="stBaseButton-primary"]:active {
+        transform: translateY(2px);
+        box-shadow: 0 1px 0 var(--edge);
+    }
+
+    /* ---------- Inputs ---------- */
+    [data-baseweb="input"], [data-baseweb="select"] > div, textarea {
+        border-radius: 10px !important;
+    }
+    [data-testid="stFileUploaderDropzone"] {
+        background: var(--card);
+        border: 2px dashed var(--blue);
+        border-radius: 0 0 14px 14px;
+    }
+
+    /* ---------- Page header ---------- */
+    .page-head {
+        display: flex; align-items: center; gap: 16px;
+        margin-bottom: 26px; padding-bottom: 18px;
+        border-bottom: 2px solid var(--heading);
+    }
+    .page-head-icon {
+        width: 54px; height: 54px; border-radius: 14px;
+        background: var(--hl);
+        display: grid; place-items: center; font-size: 28px; flex: none;
+        box-shadow: 3px 3px 0 var(--edge);
+    }
+    .page-title {
+        font-family: 'Bricolage Grotesque', sans-serif;
+        font-size: 34px; font-weight: 800; color: var(--heading);
+        margin: 0; line-height: 1.1; letter-spacing: -0.02em;
+    }
+    .page-sub { margin: 4px 0 0 0; color: var(--muted); font-size: 16px; }
+
+    .section-title {
+        font-family: 'Bricolage Grotesque', sans-serif;
+        font-size: 22px; font-weight: 700; color: var(--heading);
+        margin: 34px 0 14px 0; letter-spacing: -0.01em;
+    }
+
+    /* ---------- Dashboard banner ---------- */
+    .banner {
+        background: var(--ink);
+        border-radius: 18px; padding: 34px 38px;
+        display: flex; justify-content: space-between;
+        align-items: center; gap: 24px; flex-wrap: wrap;
+        box-shadow: 6px 6px 0 var(--hl);
+    }
+    .banner h1 {
+        font-family: 'Bricolage Grotesque', sans-serif;
+        color: #fff !important; font-size: 36px; font-weight: 800;
+        margin: 0 0 8px 0; letter-spacing: -0.02em;
+    }
+    .banner p { color: #C3D4E0 !important; margin: 0; font-size: 16.5px; max-width: 560px; line-height: 1.55; }
+    .streak {
+        background: var(--hl); border-radius: 14px; padding: 14px 22px;
+        text-align: center; min-width: 130px;
+    }
+    .streak b {
+        display: block; font-family: 'Bricolage Grotesque', sans-serif;
+        font-size: 34px; line-height: 1; color: var(--on-hl);
+    }
+    .streak span { font-size: 13.5px; font-weight: 600; color: var(--on-hl) !important; }
+
+    /* ---------- Stats strip ---------- */
+    .strip {
+        display: grid; grid-template-columns: repeat(5, 1fr);
+        background: var(--card); border: 1.5px solid var(--line);
+        border-radius: 14px; margin-top: 28px; overflow: hidden;
+    }
+    .strip-item { padding: 20px 22px; border-right: 1.5px solid var(--line); }
+    .strip-item:last-child { border-right: none; }
+    .strip-num {
+        font-family: 'Bricolage Grotesque', sans-serif;
+        font-size: 32px; font-weight: 800; color: var(--heading); line-height: 1.05;
+    }
+    .strip-label { font-size: 14px; color: var(--muted); margin-top: 4px; }
+    @media (max-width: 800px) {
+        .strip { grid-template-columns: repeat(2, 1fr); }
+        .strip-item { border-bottom: 1.5px solid var(--line); }
+    }
+
+    /* ---------- Guided path ---------- */
+    .steps { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; }
+    .step {
+        background: var(--card); border: 1.5px solid var(--line);
+        border-radius: 12px; padding: 16px;
+    }
+    .step-dot {
+        width: 30px; height: 30px; border-radius: 50%;
+        background: var(--blue-soft); color: var(--blue-text) !important;
+        font-weight: 800; display: grid; place-items: center; margin-bottom: 10px;
+    }
+    .step-name { font-weight: 700; color: var(--heading); font-size: 15px; line-height: 1.3; }
+    .step-state { font-size: 13px; color: var(--muted) !important; margin-top: 3px; }
+    .step.done { background: var(--good-soft); border-color: var(--good); }
+    .step.done .step-dot { background: var(--good); color: #fff !important; }
+    .step.next { border: 2px solid var(--heading); box-shadow: 4px 4px 0 var(--hl); }
+    .step.next .step-dot { background: var(--blue); color: #fff !important; }
+    @media (max-width: 900px) { .steps { grid-template-columns: repeat(2, 1fr); } }
+
+    /* ---------- Toolkit ---------- */
+    .tool {
+        background: var(--card); border: 1.5px solid var(--line);
+        border-radius: 14px; padding: 20px; min-height: 150px;
+    }
+    .tool-icon {
+        width: 42px; height: 42px; border-radius: 10px; background: var(--blue-soft);
+        display: grid; place-items: center; font-size: 22px;
+    }
+    .tool h3 { font-size: 18px; margin: 14px 0 4px 0; }
+    .tool p { color: var(--muted) !important; margin: 0; font-size: 14.5px; line-height: 1.5; }
+
+    /* ---------- Upload ---------- */
+    .upload-intro {
+        background: var(--blue); border-radius: 14px 14px 0 0;
+        padding: 24px 28px; margin-top: 34px;
+    }
+    .upload-intro h2 {
+        color: #fff !important; margin: 0 0 4px 0; font-size: 24px;
+        font-family: 'Bricolage Grotesque', sans-serif;
+    }
+    .upload-intro p { color: #D7ECF6 !important; margin: 0; }
+
+    /* ---------- Document card ---------- */
+    .doc-card {
+        background: var(--card); border: 1.5px solid var(--line);
+        border-left: 6px solid var(--hl); border-radius: 12px;
+        padding: 18px 22px; display: flex; gap: 30px; flex-wrap: wrap; align-items: center;
+    }
+    .doc-card .doc-name { font-weight: 700; font-size: 17px; color: var(--heading); word-break: break-word; flex: 1 1 260px; }
+    .doc-card .doc-stat b { font-family: 'Bricolage Grotesque', sans-serif; font-size: 24px; color: var(--heading); display: block; line-height: 1.1; }
+    .doc-card .doc-stat span { font-size: 13.5px; color: var(--muted) !important; }
+
+    /* ---------- Landing ---------- */
+    .landing-grid {
+        max-width: 1080px; margin: 0 auto; padding: 56px 10px 10px 10px;
+        display: grid; grid-template-columns: 1.15fr 1fr; gap: 40px; align-items: center;
+    }
+    @media (max-width: 900px) { .landing-grid { grid-template-columns: 1fr; } .mock { display: none; } }
+    .landing-pill {
+        display: inline-block; background: var(--hl); color: var(--on-hl);
+        font-weight: 700; font-size: 14.5px; padding: 8px 16px; border-radius: 999px;
+    }
+    .landing-title {
+        font-family: 'Bricolage Grotesque', sans-serif;
+        font-size: clamp(46px, 7vw, 82px); font-weight: 800; color: #fff;
+        line-height: 0.98; letter-spacing: -0.035em; margin: 24px 0 20px 0;
+    }
+    .landing-sub { color: #CEDDE7; font-size: 19px; line-height: 1.6; max-width: 560px; }
+    .landing-list { margin: 30px 0 6px 0; display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px 24px; max-width: 520px; }
+    .landing-list div { color: #fff; font-size: 16.5px; font-weight: 500; }
+    .landing-list span { color: var(--hl); margin-right: 8px; }
+
+    .mock { position: relative; min-height: 420px; }
+    .mock-q {
+        position: absolute; top: 10px; left: 0; right: 30px;
+        background: #fff; border-radius: 16px; padding: 24px;
+        box-shadow: 8px 8px 0 rgba(255,225,77,.9); transform: rotate(-2deg);
+    }
+    .mock-q small { color: var(--blue); font-weight: 700; }
+    .mock-q b { display: block; color: var(--ink); font-size: 18px; margin: 6px 0 14px 0; line-height: 1.4; font-family: 'Bricolage Grotesque', sans-serif; }
+    .mock-opt { border: 1.5px solid var(--line); border-radius: 8px; padding: 9px 12px; margin-top: 8px; font-size: 15px; color: var(--text); }
+    .mock-opt.on { border-color: var(--good); background: var(--good-soft); font-weight: 700; }
+    .mock-card {
+        position: absolute; bottom: 0; right: 0; width: 76%;
+        background: var(--blue); border-radius: 16px; padding: 22px 24px;
+        transform: rotate(3deg); box-shadow: 6px 6px 0 rgba(0,0,0,.25);
+    }
+    .mock-card small { color: #D0E8F4; font-weight: 600; }
+    .mock-card b { display: block; color: #fff; font-size: 18px; margin-top: 6px; line-height: 1.4; font-family: 'Bricolage Grotesque', sans-serif; }
+
+    /* ---------- Login ---------- */
+    .login-brand {
+        background: var(--ink); border-radius: 20px; padding: 44px 40px;
+        min-height: 540px; display: flex; flex-direction: column; justify-content: space-between;
+        box-shadow: 6px 6px 0 var(--hl);
+    }
+    .login-brand .mark {
+        width: 58px; height: 58px; border-radius: 16px; background: var(--hl);
+        display: grid; place-items: center; font-size: 30px;
+    }
+    .login-brand h1 {
+        font-family: 'Bricolage Grotesque', sans-serif;
+        color: #fff !important; font-size: 44px; line-height: 1.04;
+        letter-spacing: -0.03em; margin: 26px 0 14px 0;
+    }
+    .login-brand p { color: #C3D4E0 !important; font-size: 17px; line-height: 1.6; margin: 0; }
+    .login-brand ul { list-style: none; padding: 0; margin: 28px 0 0 0; }
+    .login-brand li { color: #fff !important; padding: 7px 0; font-size: 16px; }
+    .login-brand li span { color: var(--hl) !important; margin-right: 10px; }
+
+    /* ---------- Topics ---------- */
+    .topic-card {
+        background: var(--card); border: 1.5px solid var(--line);
+        border-radius: 12px; padding: 16px 20px;
+        display: flex; align-items: center; gap: 16px; min-height: 60px;
+    }
+    .topic-num {
+        width: 34px; height: 34px; border-radius: 8px;
+        background: var(--blue-soft); color: var(--blue-text) !important;
+        font-weight: 800; display: grid; place-items: center; flex: none;
+    }
+    .topic-name { font-weight: 700; font-size: 17px; color: var(--heading); }
+
+    /* ---------- Quiz ---------- */
+    .q-card {
+        background: var(--card); border: 1.5px solid var(--line);
+        border-radius: 12px; padding: 20px 24px 14px 24px; margin: 20px 0 6px 0;
+    }
+    .q-index { color: var(--blue-text) !important; font-weight: 700; font-size: 14px; }
+    .q-text { color: var(--heading); font-size: 19px; font-weight: 700; margin-top: 4px; line-height: 1.45; }
+
+    .score-card {
+        background: var(--ink); border-radius: 16px; padding: 28px 32px;
+        display: flex; align-items: center; gap: 26px; flex-wrap: wrap;
+        margin: 26px 0 10px 0; box-shadow: 6px 6px 0 var(--hl);
+    }
+    .score-big { font-family: 'Bricolage Grotesque', sans-serif; font-size: 60px; font-weight: 800; color: var(--hl); line-height: 1; }
+    .score-card p { color: #fff !important; margin: 0; font-size: 18px; font-weight: 600; }
+    .score-card small { color: #BCD0DD; font-size: 14.5px; }
+
+    .review { border-radius: 10px; padding: 14px 18px; margin: 8px 0; border-left: 5px solid; }
+    .review.good { background: var(--good-soft); border-color: var(--good); }
+    .review.bad { background: var(--bad-soft); border-color: var(--bad); }
+    .review b, .review div { color: var(--text) !important; }
+    .review .why { color: var(--muted) !important; margin-top: 6px; font-size: 14.5px; }
+
+    /* ---------- Flashcards ---------- */
+    .flash {
+        background: var(--blue); border-radius: 18px;
+        padding: 40px 42px; min-height: 230px; margin: 18px 0 10px 0;
+        display: flex; flex-direction: column; justify-content: center;
+        box-shadow: 8px 8px 0 var(--edge);
+    }
+    .flash small { color: #D0E8F4 !important; font-weight: 600; font-size: 14px; }
+    .flash .flash-text { color: #fff !important; font-size: 28px; font-weight: 700; margin-top: 10px; line-height: 1.35; font-family: 'Bricolage Grotesque', sans-serif; }
+    .flash.back { background: var(--hl); }
+    .flash.back small { color: var(--on-hl) !important; }
+    .flash.back .flash-text { color: var(--on-hl) !important; font-size: 22px; font-family: 'Figtree', sans-serif; font-weight: 600; }
+    .flash-q { margin-top: 14px; font-size: 14.5px; color: var(--on-hl) !important; opacity: .7; }
+
+    /* ---------- Planner ---------- */
+    .plan-day {
+        display: flex; gap: 18px; align-items: stretch;
+        background: var(--card); border: 1.5px solid var(--line);
+        border-radius: 12px; margin-bottom: 10px; overflow: hidden;
+    }
+    .plan-badge {
+        background: var(--hl); color: var(--on-hl) !important;
+        padding: 14px 20px; min-width: 92px; text-align: center;
+        display: flex; flex-direction: column; justify-content: center;
+    }
+    .plan-badge small { color: var(--on-hl) !important; font-weight: 600; }
+    .plan-badge b { font-family: 'Bricolage Grotesque', sans-serif; font-size: 30px; line-height: 1; color: var(--on-hl) !important; }
+    .plan-body { padding: 14px 18px 14px 0; flex: 1; }
+    .plan-body .goal { font-weight: 700; font-size: 17px; color: var(--heading); }
+    .plan-body .meta { color: var(--muted) !important; font-size: 14.5px; margin-top: 4px; }
+
+    /* ---------- Progress / adaptive ---------- */
+    .panel {
+        background: var(--card); border: 1.5px solid var(--line);
+        border-radius: 16px; padding: 26px; height: 100%;
+    }
+    .panel h3 { margin: 0 0 14px 0; font-size: 18px; }
+    .ring-wrap { display: flex; align-items: center; gap: 22px; flex-wrap: wrap; }
+    .level {
+        display: inline-block; background: var(--hl); color: var(--on-hl) !important;
+        font-weight: 800; padding: 5px 12px; border-radius: 999px; font-size: 14px;
+    }
+    .level-text { color: var(--muted) !important; margin: 10px 0 0 0; max-width: 240px; line-height: 1.5; }
+
+    .bar-row { display: grid; grid-template-columns: 76px 1fr 36px; gap: 12px; align-items: center; margin: 12px 0; }
+    .bar-row span { color: var(--muted) !important; font-size: 14.5px; }
+    .bar-row b { color: var(--heading); text-align: right; }
+    .bar { height: 14px; background: var(--blue-soft); border-radius: 999px; overflow: hidden; }
+    .bar i { display: block; height: 100%; border-radius: 999px; }
+
+    .week { display: flex; gap: 10px; flex-wrap: wrap; }
+    .day { text-align: center; }
+    .day .dot {
+        width: 40px; height: 40px; border-radius: 50%;
+        border: 2px solid var(--line); display: grid; place-items: center;
+        font-size: 16px; color: var(--muted);
+    }
+    .day.on .dot { background: var(--hl); border-color: var(--on-hl); color: var(--on-hl); }
+    .day.today .dot { border-color: var(--blue); }
+    .day small { color: var(--muted) !important; font-size: 12.5px; display: block; margin-top: 4px; }
+
+    .insight {
+        background: var(--card); border: 1.5px solid var(--line);
+        border-left: 6px solid var(--blue); border-radius: 10px;
+        padding: 16px 20px; margin: 10px 0; font-size: 16.5px;
+        color: var(--text) !important; font-weight: 500;
+    }
+
+    .empty {
+        background: var(--card); border: 2px dashed var(--line);
+        border-radius: 16px; padding: 44px 24px; text-align: center; margin: 10px 0 14px 0;
+    }
+    .empty-icon { font-size: 40px; }
+    .empty h3 { margin: 10px 0 6px 0; }
+    .empty p { color: var(--muted) !important; max-width: 420px; margin: 0 auto; }
+
+    /* ---------- Streamlit widgets ---------- */
+    [data-testid="stMetric"] {
+        background: var(--card); border: 1.5px solid var(--line);
+        border-radius: 12px; padding: 16px 18px;
+    }
+    [data-testid="stMetricValue"] { font-family: 'Bricolage Grotesque', sans-serif; font-weight: 800; color: var(--heading); }
+    [data-testid="stExpander"] { background: var(--card); border: 1.5px solid var(--line) !important; border-radius: 12px; }
+    [data-testid="stProgress"] > div > div > div > div { background-color: var(--blue); }
+    [data-testid="stTabs"] [role="tab"] { font-weight: 700; font-size: 16px; }
+    [data-baseweb="tab-highlight"] { background-color: var(--blue) !important; }
+    [data-testid="stProgress"] > div > div { background-color: var(--blue-soft); }
+    [data-testid="stChatMessage"] { background: var(--card); border: 1.5px solid var(--line); border-radius: 12px; }
+
+    @media (prefers-reduced-motion: reduce) {
+        * { transition: none !important; }
+    }
+    """
+
+    extra = DARK_EXTRA_CSS if dark else ""
+    render_html(f"<style>{tokens}{css}{extra}</style>")
+
+
+def landing_background(image_path=None):
+    """Flat dark landing backdrop (no gradients)."""
     render_html(
-        f"""
+        """
         <style>
-
-        /* ================================================
-           MAIN
-        ================================================ */
-
-        [data-testid="stMainBlockContainer"] {{
-            max-width: 1250px;
-            padding-top: 25px;
-            padding-bottom: 70px;
-        }}
-
-
-        /* ================================================
-           SIDEBAR
-        ================================================ */
-
-        [data-testid="stSidebar"] {{
-            background: {NAVY};
-        }}
-
-        [data-testid="stSidebar"] * {{
-            color: white;
-        }}
-
-        [data-testid="stSidebar"] div.stButton {{
-            width: 100%;
-            margin-bottom: 9px;
-        }}
-
-        [data-testid="stSidebar"] div.stButton > button {{
-            width: 100%;
-            min-height: 48px;
-            border-radius: 12px;
-
-            background: {NAVY_LIGHT};
-            color: white;
-
-            border: 1px solid rgba(255,255,255,0.15);
-
-            font-size: 15px;
-            font-weight: 700;
-
-            transition: all 0.2s ease;
-        }}
-
-        [data-testid="stSidebar"] div.stButton > button:hover {{
-            background: white;
-            color: {NAVY};
-            transform: translateX(4px);
-        }}
-
-
-        /* ================================================
-           NORMAL BUTTONS
-        ================================================ */
-
-        div.stButton > button {{
-            border-radius: 12px;
-
-            background: white;
-            color: {NAVY};
-
-            border: 1px solid {BORDER};
-
-            font-weight: 700;
-
-            min-height: 44px;
-
-            transition: all 0.2s ease;
-        }}
-
-        div.stButton > button:hover {{
-            background: {NAVY};
-            color: white;
-
-            border-color: {NAVY};
-
-            transform: translateY(-2px);
-        }}
-
-
-        /* ================================================
-           LANDING
-        ================================================ */
-
-        .landing {{
-            text-align: center;
-            padding: 80px 25px;
-        }}
-
-        .badge {{
-            display: inline-block;
-
-            padding: 10px 22px;
-
-            border-radius: 30px;
-
-            background: rgba(255,255,255,0.12);
-
-            border: 1px solid rgba(255,255,255,0.20);
-
-            color: white;
-
-            font-weight: 800;
-
-            letter-spacing: 1px;
-        }}
-
-        .landing-title {{
-            color: white;
-
-            font-size: clamp(45px, 7vw, 78px);
-
-            font-weight: 900;
-
-            margin-top: 25px;
-
-            letter-spacing: -3px;
-        }}
-
-        .landing-subtitle {{
-            color: rgba(255,255,255,0.88);
-
-            font-size: 20px;
-
-            max-width: 800px;
-
-            margin: auto;
-
-            line-height: 1.7;
-        }}
-
-        .chips {{
-            margin-top: 35px;
-        }}
-
-        .chip {{
-            display: inline-block;
-
-            padding: 12px 20px;
-
-            margin: 7px;
-
-            border-radius: 30px;
-
-            background: rgba(255,255,255,0.12);
-
-            border: 1px solid rgba(255,255,255,0.15);
-
-            color: white;
-        }}
-
-
-        /* ================================================
-           HERO
-        ================================================ */
-
-        .hero {{
-            background: white;
-
-            padding: 40px;
-
-            border-radius: 25px;
-
-            text-align: center;
-
-            border: 1px solid {BORDER};
-
-            box-shadow:
-                0 12px 35px rgba(11,31,58,0.08);
-        }}
-
-        .hero h1 {{
-            color: {NAVY};
-
-            font-size: 48px;
-
-            margin: 0;
-        }}
-
-        .hero p {{
-            color: {MUTED};
-
-            font-size: 18px;
-
-            margin-bottom: 0;
-        }}
-
-
-        /* ================================================
-           SECTION TITLE
-        ================================================ */
-
-        .section-title {{
-            color: white;
-
-            font-size: 28px;
-
-            font-weight: 900;
-
-            margin-top: 30px;
-
-            margin-bottom: 18px;
-        }}
-
-
-        /* ================================================
-           FEATURE CARDS
-        ================================================ */
-
-        .feature-card {{
-            background: {NAVY};
-
-            padding: 30px;
-
-            border-radius: 20px;
-
-            text-align: center;
-
-            color: white;
-
-            min-height: 210px;
-
-            display: flex;
-
-            flex-direction: column;
-
-            justify-content: center;
-
-            box-shadow:
-                0 10px 25px rgba(11,31,58,0.15);
-        }}
-
-        .feature-icon {{
-            font-size: 45px;
-        }}
-
-        .feature-card h2 {{
-            color: white;
-
-            margin: 10px 0;
-        }}
-
-        .feature-card p {{
-            color: #DDE6F2;
-
-            margin: 0;
-        }}
-
-
-        /* ================================================
-           STAT CARDS
-        ================================================ */
-
-        .stat-card {{
-            background: white;
-
-            border: 1px solid {BORDER};
-
-            border-radius: 16px;
-
-            padding: 22px;
-
-            text-align: center;
-
-            min-height: 115px;
-
-            box-shadow:
-                0 8px 25px rgba(11,31,58,0.05);
-        }}
-
-        .stat-number {{
-            color: {NAVY};
-
-            font-size: 30px;
-
-            font-weight: 900;
-        }}
-
-        .stat-label {{
-            color: #69798C;
-
-            font-size: 13px;
-
-            margin-top: 5px;
-        }}
-
-
-        /* ================================================
-           INFO CARDS
-        ================================================ */
-
-        .info-card {{
-            background: white;
-
-            border: 1px solid {BORDER};
-
-            border-left: 5px solid {NAVY};
-
-            border-radius: 15px;
-
-            padding: 20px;
-
-            margin: 12px 0;
-
-            box-shadow:
-                0 6px 20px rgba(11,31,58,0.05);
-        }}
-
-        .info-card h3 {{
-            color: {NAVY};
-
-            margin-top: 0;
-        }}
-
-        .info-card p {{
-            color: {MUTED};
-        }}
-
-
-        /* ================================================
-           UPLOAD
-        ================================================ */
-
-        .upload-box {{
-            background:
-                linear-gradient(
-                    135deg,
-                    {NAVY},
-                    {NAVY_LIGHT}
-                );
-
-            padding: 40px;
-
-            border-radius: 25px;
-
-            text-align: center;
-
-            margin-top: 30px;
-
-            color: white;
-        }}
-
-        .upload-box h1 {{
-            color: white;
-        }}
-
-        .upload-box p {{
-            color: rgba(255,255,255,0.80);
-        }}
-
-
-        /* ================================================
-           QUIZ
-        ================================================ */
-
-        .quiz-card {{
-            background: white;
-
-            border: 1px solid {BORDER};
-
-            border-radius: 18px;
-
-            padding: 25px;
-
-            margin-bottom: 18px;
-
-            box-shadow:
-                0 7px 20px rgba(11,31,58,0.05);
-        }}
-
-        .question-number {{
-            color: {BLUE};
-
-            font-weight: 800;
-
-            font-size: 14px;
-        }}
-
-        .question-text {{
-            color: {NAVY};
-
-            font-size: 19px;
-
-            font-weight: 800;
-
-            margin-top: 8px;
-        }}
-
-
-        /* ================================================
-           FLASHCARD
-        ================================================ */
-
-        .flashcard {{
-            background:
-                linear-gradient(
-                    135deg,
-                    {NAVY},
-                    {NAVY_LIGHT}
-                );
-
-            color: white;
-
-            padding: 45px;
-
-            border-radius: 22px;
-
-            text-align: center;
-
-            margin: 15px 0;
-
-            min-height: 180px;
-
-            display: flex;
-
-            flex-direction: column;
-
-            justify-content: center;
-        }}
-
-        .flashcard-label {{
-            color: #BBD4F0;
-
-            font-size: 13px;
-
-            font-weight: 800;
-
-            text-transform: uppercase;
-
-            letter-spacing: 1px;
-        }}
-
-        .flashcard-question {{
-            color: white;
-
-            font-size: 23px;
-
-            font-weight: 800;
-
-            margin-top: 12px;
-        }}
-
-        .answer-box {{
-            background: #F5F8FC;
-
-            border: 1px solid {BORDER};
-
-            padding: 25px;
-
-            border-radius: 16px;
-
-            color: {TEXT};
-
-            margin-top: 10px;
-        }}
-
-
-        /* ================================================
-           PLAN
-        ================================================ */
-
-        .plan-day {{
-            background: white;
-
-            border: 1px solid {BORDER};
-
-            border-radius: 15px;
-
-            padding: 20px;
-
-            margin-bottom: 12px;
-        }}
-
-        .plan-day h3 {{
-            color: {NAVY};
-        }}
-
-        .plan-day p {{
-            color: {MUTED};
-        }}
-
-
-        /* ================================================
-           SIDEBAR BRAND
-        ================================================ */
-
-        .sidebar-brand {{
-            text-align: center;
-
-            padding: 10px 5px 18px 5px;
-        }}
-
-        .sidebar-brand-icon {{
-            font-size: 45px;
-        }}
-
-        .sidebar-brand-title {{
-            color: white;
-
-            font-size: 21px;
-
-            font-weight: 900;
-
-            margin-top: 5px;
-        }}
-
-        .sidebar-brand-subtitle {{
-            color: rgba(255,255,255,0.65);
-
-            font-size: 12px;
-
-            margin-top: 4px;
-        }}
-
+            [data-testid="stAppViewContainer"] { background: var(--landing); }
+            [data-testid="stMainBlockContainer"] label,
+            [data-testid="stMainBlockContainer"] label * { color: #FFFFFF !important; }
         </style>
         """
     )
@@ -725,7 +997,6 @@ def common_css():
 # ============================================================
 
 def reset_document_data():
-
     st.session_state.chunks = []
     st.session_state.cleaned_text = ""
     st.session_state.file_name = ""
@@ -736,12 +1007,20 @@ def reset_document_data():
     st.session_state.topics = []
     st.session_state.quiz_questions = []
     st.session_state.flashcards = []
+    st.session_state.ai_summary = ""
 
     st.session_state.selected_topic = None
 
     st.session_state.quiz_generated = False
+    st.session_state.quiz_submitted = False
     st.session_state.flashcards_generated = False
     st.session_state.topics_generated = False
+
+    st.session_state.fc_index = 0
+    st.session_state.fc_show = False
+
+    st.session_state.quiz_id += 1
+    st.session_state.flashcard_id += 1
 
 
 # ============================================================
@@ -749,54 +1028,32 @@ def reset_document_data():
 # ============================================================
 
 def process_pdf(uploaded_file):
-
     if uploaded_file is None:
         return False
 
-    temp_path = Path(
-        f"temp_{uploaded_file.name}"
-    )
+    temp_path = Path(f"temp_{uploaded_file.name}")
 
     try:
-
         with open(temp_path, "wb") as file:
+            file.write(uploaded_file.getbuffer())
 
-            file.write(
-                uploaded_file.getbuffer()
-            )
-
-        with st.spinner(
-            "Processing your PDF..."
-        ):
-
-            raw_text = read_pdf(
-                str(temp_path)
-            )
+        with st.spinner("Reading your PDF..."):
+            raw_text = read_pdf(str(temp_path))
 
             if not raw_text or not raw_text.strip():
-
                 st.error(
-                    "Could not extract text from this PDF."
+                    "We couldn't read any text from this PDF. "
+                    "If it's a scan, try a version with selectable text."
                 )
-
                 return False
 
-            cleaned = clean_text(
-                raw_text
-            )
+            cleaned = clean_text(raw_text)
 
             if not cleaned or not cleaned.strip():
-
-                st.error(
-                    "The PDF does not contain usable study text."
-                )
-
+                st.error("This PDF doesn't contain usable study text.")
                 return False
 
-            chunks = chunk_text(
-                cleaned
-            )
-
+            chunks = chunk_text(cleaned)
             chunks = [
                 str(chunk).strip()
                 for chunk in chunks
@@ -804,44 +1061,26 @@ def process_pdf(uploaded_file):
             ]
 
             if not chunks:
-
-                st.error(
-                    "No study chunks were created."
-                )
-
+                st.error("No study sections could be created from this PDF.")
                 return False
 
         reset_document_data()
 
         st.session_state.cleaned_text = cleaned
-
         st.session_state.chunks = chunks
-
-        st.session_state.file_name = (
-            uploaded_file.name
-        )
-
+        st.session_state.file_name = uploaded_file.name
         st.session_state.document_loaded = True
         record_study_activity()
 
-        st.success(
-            f"PDF processed successfully: {uploaded_file.name}"
-        )
-
+        st.success(f"Loaded {uploaded_file.name}")
         return True
 
     except Exception as exc:
-
-        st.error(
-            f"Error processing PDF: {exc}"
-        )
-
+        st.error(f"Couldn't process this PDF: {exc}")
         return False
 
     finally:
-
         if temp_path.exists():
-
             try:
                 temp_path.unlink()
             except Exception:
@@ -849,43 +1088,31 @@ def process_pdf(uploaded_file):
 
 
 # ============================================================
-# MISTRAL HELPER
+# AI HELPERS
 # ============================================================
 
 def ai_generate(prompt, system_prompt=None):
-
-
     try:
-
-        result = ask_llm(
-            prompt,
-            system_prompt=system_prompt
-        )
+        result = ask_llm(prompt, system_prompt=system_prompt)
 
         if not result:
+            print("AI GENERATION ERROR: Empty response from ask_llm()")
             return ""
 
-        return str(result).strip()
+        result = str(result).strip()
 
-    except TypeError:
-
-        # Compatibility with older ask_llm(prompt)
-        try:
-
-            result = ask_llm(prompt)
-
-            return str(result).strip()
-
-        except Exception:
-
+        if result.startswith("AI service is temporarily unavailable"):
+            print(f"AI GENERATION ERROR: {result}")
             return ""
 
-    except Exception:
+        return result
 
+    except Exception as e:
+        print(f"AI GENERATION ERROR: {type(e).__name__}: {e}")
         return ""
-    
-def generate_ai_summary():
 
+
+def generate_ai_summary():
     if not st.session_state.document_loaded:
         return ""
 
@@ -934,82 +1161,64 @@ STUDY MATERIAL:
         system_prompt=(
             "Create accurate study summaries using only "
             "the supplied educational material."
-        )
+        ),
     )
 
     return response.strip() if response else ""
 
-# ============================================================
-# JSON EXTRACTION
-# ============================================================
 
 def extract_json(text):
-
     if not text:
         return None
 
     cleaned = text.strip()
-
-    # Remove markdown fences
-    cleaned = re.sub(
-        r"```json",
-        "",
-        cleaned,
-        flags=re.IGNORECASE
-    )
-
-    cleaned = re.sub(
-        r"```",
-        "",
-        cleaned
-    ).strip()
+    cleaned = re.sub(r"```json", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"```", "", cleaned).strip()
 
     try:
         return json.loads(cleaned)
     except Exception:
         pass
 
-    # Try object
-    object_match = re.search(
-        r"\{.*\}",
-        cleaned,
-        flags=re.DOTALL
-    )
-
+    object_match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
     if object_match:
-
         try:
-            return json.loads(
-                object_match.group(0)
-            )
+            return json.loads(object_match.group(0))
         except Exception:
             pass
 
-    # Try array
-    array_match = re.search(
-        r"\[.*\]",
-        cleaned,
-        flags=re.DOTALL
-    )
-
+    array_match = re.search(r"\[.*\]", cleaned, flags=re.DOTALL)
     if array_match:
-
         try:
-            return json.loads(
-                array_match.group(0)
-            )
+            return json.loads(array_match.group(0))
         except Exception:
             pass
 
     return None
 
 
-# ============================================================
-# TOPIC GENERATOR
-# ============================================================
+def detect_topics_locally():
+    text = st.session_state.cleaned_text
+    topics = []
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        cleaned = re.sub(r"^[#\d\.\-\)\s]+", "", line).strip()
+
+        if 3 <= len(cleaned) <= 90 and len(cleaned.split()) <= 12:
+            if cleaned not in topics:
+                topics.append(cleaned)
+
+    if not topics:
+        topics = ["General Study Material"]
+
+    return topics[:10]
+
 
 def generate_topics():
-
     if not st.session_state.document_loaded:
         return []
 
@@ -1045,81 +1254,31 @@ STUDY MATERIAL:
         system_prompt=(
             "You extract study topics accurately "
             "from supplied educational material."
-        )
+        ),
     )
 
     parsed = extract_json(response)
 
     if isinstance(parsed, list):
-
         topics = []
-
         for item in parsed:
-
             if isinstance(item, str):
-
                 item = item.strip()
-
                 if item and item not in topics:
                     topics.append(item)
-
         return topics[:10]
 
-    # Fallback
     return detect_topics_locally()
 
 
-def detect_topics_locally():
-
-    text = st.session_state.cleaned_text
-
-    topics = []
-
-    for line in text.splitlines():
-
-        line = line.strip()
-
-        if not line:
-            continue
-
-        cleaned = re.sub(
-            r"^[#\d\.\-\)\s]+",
-            "",
-            line
-        ).strip()
-
-        if (
-            3 <= len(cleaned) <= 90
-            and len(cleaned.split()) <= 12
-        ):
-
-            if cleaned not in topics:
-                topics.append(cleaned)
-
-    if not topics:
-
-        topics = [
-            "General Study Material"
-        ]
-
-    return topics[:10]
-
-
-# ============================================================
-# QUIZ GENERATOR
-# ============================================================
-
 def generate_quiz(topic=None, number_of_questions=5):
-
     if not st.session_state.document_loaded:
         return []
 
     material = st.session_state.cleaned_text[:16000]
 
     topic_instruction = ""
-
     if topic:
-
         topic_instruction = f"""
 Focus primarily on this topic:
 {topic}
@@ -1167,7 +1326,7 @@ STUDY MATERIAL:
         system_prompt=(
             "Generate accurate educational MCQs "
             "using only supplied study material."
-        )
+        ),
     )
 
     parsed = extract_json(response)
@@ -1178,26 +1337,13 @@ STUDY MATERIAL:
     valid_questions = []
 
     for item in parsed:
-
         if not isinstance(item, dict):
             continue
 
-        question = str(
-            item.get("question", "")
-        ).strip()
-
-        options = item.get(
-            "options",
-            []
-        )
-
-        answer = str(
-            item.get("answer", "")
-        ).strip()
-
-        explanation = str(
-            item.get("explanation", "")
-        ).strip()
+        question = str(item.get("question", "")).strip()
+        options = item.get("options", [])
+        answer = str(item.get("answer", "")).strip()
+        explanation = str(item.get("explanation", "")).strip()
 
         if (
             not question
@@ -1207,10 +1353,7 @@ STUDY MATERIAL:
         ):
             continue
 
-        options = [
-            str(option).strip()
-            for option in options
-        ]
+        options = [str(option).strip() for option in options]
 
         if answer not in options:
             continue
@@ -1223,26 +1366,21 @@ STUDY MATERIAL:
                 "explanation": explanation,
             }
         )
+
     for question in valid_questions:
         random.shuffle(question["options"])
+
     return valid_questions[:number_of_questions]
 
 
-# ============================================================
-# FLASHCARD GENERATOR
-# ============================================================
-
 def generate_flashcards(topic=None, number_of_cards=8):
-
     if not st.session_state.document_loaded:
         return []
 
     material = st.session_state.cleaned_text[:16000]
 
     topic_instruction = ""
-
     if topic:
-
         topic_instruction = f"""
 Focus primarily on this topic:
 {topic}
@@ -1282,7 +1420,7 @@ STUDY MATERIAL:
         system_prompt=(
             "Create accurate educational flashcards "
             "from supplied material."
-        )
+        ),
     )
 
     parsed = extract_json(response)
@@ -1293,456 +1431,108 @@ STUDY MATERIAL:
     cards = []
 
     for item in parsed:
-
         if not isinstance(item, dict):
             continue
 
-        question = str(
-            item.get("question", "")
-        ).strip()
-
-        answer = str(
-            item.get("answer", "")
-        ).strip()
+        question = str(item.get("question", "")).strip()
+        answer = str(item.get("answer", "")).strip()
 
         if question and answer:
-
-            cards.append(
-                {
-                    "question": question,
-                    "answer": answer,
-                }
-            )
+            cards.append({"question": question, "answer": answer})
 
     return cards[:number_of_cards]
 
 
-# ============================================================
-# ADAPTIVE LEARNING
-# ============================================================
-
 def generate_adaptive_recommendations():
-
-    accuracy = 0
-
-    if st.session_state.quiz_attempted > 0:
-
-        accuracy = round(
-            (
-                st.session_state.correct_answers
-                / st.session_state.quiz_attempted
-            ) * 100
-        )
-
+    accuracy = accuracy_percent()
     recommendations = []
 
     if accuracy < 50:
-
         recommendations.append(
             "Focus on basic concepts before attempting advanced questions."
         )
-
-        recommendations.append(
-            "Review your flashcards and retry the quiz."
-        )
+        recommendations.append("Review your flashcards and retry the quiz.")
 
     elif accuracy < 75:
-
         recommendations.append(
             "You have a developing understanding. Practice weak concepts."
         )
-
         recommendations.append(
             "Use topic-specific quizzes for targeted revision."
         )
 
     else:
-
-        recommendations.append(
-            "Your performance is strong. Try harder questions."
-        )
-
-        recommendations.append(
-            "Use flashcards for spaced revision."
-        )
+        recommendations.append("Your performance is strong. Try harder questions.")
+        recommendations.append("Use flashcards for spaced revision.")
 
     if st.session_state.flashcards_reviewed == 0:
-
-        recommendations.append(
-            "Start reviewing flashcards to strengthen memory."
-        )
-
-    if not recommendations:
-
-        recommendations.append(
-            "Upload study material and complete a quiz to receive adaptive recommendations."
-        )
+        recommendations.append("Start reviewing flashcards to strengthen memory.")
 
     return recommendations
 
-# ============================================================
-# AUTHENTICATION
-# ============================================================
-
-DB_PATH = "study_champion.db"
-
-
-def init_auth_database():
-    conn = sqlite3.connect(DB_PATH)
-
-    cursor = conn.cursor()
-
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL
-        )
-        """
-    )
-
-    conn.commit()
-    conn.close()
-
-
-def hash_password(password):
-    return hashlib.sha256(
-        password.encode("utf-8")
-    ).hexdigest()
-
-
-def register_user(username, password):
-    username = username.strip()
-
-    if not username or not password:
-        return False, "Username and password are required."
-
-    if len(password) < 6:
-        return False, "Password must contain at least 6 characters."
-
-    password_hash = hash_password(password)
-
-    try:
-        conn = sqlite3.connect(DB_PATH)
-
-        cursor = conn.cursor()
-
-        cursor.execute(
-            """
-            INSERT INTO users (username, password_hash)
-            VALUES (?, ?)
-            """,
-            (username, password_hash),
-        )
-
-        conn.commit()
-        conn.close()
-
-        return True, "Account created successfully."
-
-    except sqlite3.IntegrityError:
-        return False, "Username already exists."
-
-    except Exception as exc:
-        return False, f"Registration failed: {exc}"
-
-
-def login_user(username, password):
-    username = username.strip()
-
-    password_hash = hash_password(password)
-
-    conn = sqlite3.connect(DB_PATH)
-
-    cursor = conn.cursor()
-
-    cursor.execute(
-        """
-        SELECT id, username
-        FROM users
-        WHERE username = ?
-        AND password_hash = ?
-        """,
-        (username, password_hash),
-    )
-
-    user = cursor.fetchone()
-
-    conn.close()
-
-    if user:
-        return True, user[0], user[1]
-
-    return False, None, None
-
-def record_study_activity():
-    user_id = st.session_state.get("user_id")
-
-    if not user_id:
-        return
-
-    today = date.today().isoformat()
-
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-
-        cursor.execute(
-            """
-            INSERT OR IGNORE INTO study_activity
-            (user_id, study_date)
-            VALUES (?, ?)
-            """,
-            (user_id, today),
-        )
-
-        conn.commit()
-
-        cursor.execute(
-            """
-            SELECT study_date
-            FROM study_activity
-            WHERE user_id = ?
-            ORDER BY study_date DESC
-            """,
-            (user_id,),
-        )
-
-        activity_dates = [
-            row[0]
-            for row in cursor.fetchall()
-        ]
-
-        conn.close()
-
-        streak = 0
-        expected_date = date.today()
-
-        for activity_date in activity_dates:
-
-            current_date = date.fromisoformat(
-                activity_date
-            )
-
-            if current_date == expected_date:
-                streak += 1
-                expected_date -= timedelta(days=1)
-
-            else:
-                break
-
-        st.session_state.study_streak = streak
-
-    except Exception:
-        pass
-
-
-def get_study_streak(user_id):
-    if not user_id:
-        return 0
-
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-
-        cursor.execute(
-            """
-            SELECT study_date
-            FROM study_activity
-            WHERE user_id = ?
-            ORDER BY study_date DESC
-            """,
-            (user_id,),
-        )
-
-        activity_dates = [
-            row[0]
-            for row in cursor.fetchall()
-        ]
-
-        conn.close()
-
-        streak = 0
-        expected_date = date.today()
-
-        for activity_date in activity_dates:
-
-            current_date = date.fromisoformat(
-                activity_date
-            )
-
-            if current_date == expected_date:
-                streak += 1
-                expected_date -= timedelta(days=1)
-
-            else:
-                break
-
-        return streak
-
-    except Exception:
-        return 0
-def logout_user():
-    st.session_state.logged_in = False
-    st.session_state.user_id = None
-    st.session_state.username = ""
-    st.session_state.page = "login"
-
-    reset_document_data()
 
 # ============================================================
 # SIDEBAR
 # ============================================================
 
+NAV_ITEMS = [
+    ("home", "🏠", "Dashboard"),
+    ("topics", "📚", "Topics"),
+    ("summary", "📝", "AI Summary"),
+    ("quiz", "🧠", "Quiz"),
+    ("flashcards", "🃏", "Flashcards"),
+    ("planner", "📅", "Study Planner"),
+    ("adaptive", "🤖", "Adaptive Learning"),
+    ("progress", "🎯", "Progress"),
+]
+
+
 def render_sidebar():
-
     with st.sidebar:
-
         render_html(
             """
-            <div class="sidebar-brand">
-
-                <div class="sidebar-brand-icon">
-                    🏆
+            <div class="brand">
+                <div class="brand-mark">🏆</div>
+                <div>
+                    <div class="brand-name">Study Champion</div>
+                    <div class="brand-tag">Your AI study companion</div>
                 </div>
-
-                <div class="sidebar-brand-title">
-                    STUDY CHAMPION
-                </div>
-
-                <div class="sidebar-brand-subtitle">
-                    Your AI Study Companion
-                </div>
-
             </div>
             """
         )
 
         st.divider()
 
-        # Dashboard
-        if st.button(
-            "🏠  Dashboard",
-            use_container_width=True,
-            key="nav_dashboard",
-        ):
+        for page_key, icon, label in NAV_ITEMS:
+            is_active = st.session_state.page == page_key
 
-            st.session_state.page = "home"
-            st.rerun()
-
-        # Topics
-        if st.button(
-            "📚  Topics",
-            use_container_width=True,
-            key="nav_topics",
-        ):
-
-            st.session_state.page = "topics"
-            st.rerun()
-
-        if st.button(
-          "📝  AI Summary",
-          use_container_width=True,
-          key="nav_summary",
-       ):
-
-         st.session_state.page = "summary"
-         st.rerun()
-
-        # Quiz
-        if st.button(
-            "🧠  Quiz",
-            use_container_width=True,
-            key="nav_quiz",
-        ):
-
-            st.session_state.page = "quiz"
-            st.rerun()
-
-        # Flashcards
-        if st.button(
-            "🃏  Flashcards",
-            use_container_width=True,
-            key="nav_flashcards",
-        ):
-
-            st.session_state.page = "flashcards"
-            st.rerun()
-
-        # Planner
-        if st.button(
-            "📅  Study Planner",
-            use_container_width=True,
-            key="nav_planner",
-        ):
-
-            st.session_state.page = "planner"
-            st.rerun()
-
-        # Adaptive
-        if st.button(
-            "🤖  Adaptive Learning",
-            use_container_width=True,
-            key="nav_adaptive",
-        ):
-
-            st.session_state.page = "adaptive"
-            st.rerun()
-
-        # Progress
-        if st.button(
-            "🎯  Progress",
-            use_container_width=True,
-            key="nav_progress",
-        ):
-
-            st.session_state.page = "progress"
-            st.rerun()
+            if st.button(
+                f"{icon}  {label}",
+                use_container_width=True,
+                key=f"nav_{page_key}",
+                type="primary" if is_active else "secondary",
+            ):
+                go(page_key)
 
         st.divider()
 
+        render_theme_toggle()
+
         if st.session_state.document_loaded:
-
-            file_name = st.session_state.file_name
-
             render_html(
                 f"""
-                <div style="
-                    background:rgba(255,255,255,0.08);
-                    border-radius:12px;
-                    padding:12px;
-                    margin-bottom:12px;
-                ">
-
-                    <div style="
-                        font-size:11px;
-                        color:rgba(255,255,255,0.60);
-                    ">
-                        CURRENT DOCUMENT
-                    </div>
-
-                    <div style="
-                        font-size:13px;
-                        color:white;
-                        font-weight:700;
-                        margin-top:5px;
-                        word-break:break-word;
-                    ">
-                        📄 {file_name}
-                    </div>
-
+                <div class="doc-chip">
+                    <small>Current document</small>
+                    <div>📄 {esc(st.session_state.file_name)}</div>
                 </div>
                 """
             )
 
-        # Reset
         if st.button(
-            "🔄  Reset Study Session",
+            "🔄  Reset study session",
             use_container_width=True,
             key="reset_session",
         ):
-
             reset_document_data()
 
             st.session_state.quiz_score = 0
@@ -1754,58 +1544,30 @@ def render_sidebar():
             st.session_state.study_plan = []
             st.session_state.adaptive_recommendations = []
 
-            st.session_state.page = "home"
+            go("home")
 
-            st.rerun()
         st.divider()
 
         render_html(
             f"""
-            <div style="
-                color:rgba(255,255,255,0.75);
-                text-align:center;
-                font-size:13px;
-                margin-bottom:10px;
-            ">
-                👤 Logged in as
-                <strong>{st.session_state.username}</strong>
+            <div class="user-line">
+                Signed in as <strong>{esc(st.session_state.username)}</strong>
             </div>
             """
         )
 
-        if st.button(
-            "🚪 Logout",
-            use_container_width=True,
-            key="logout_button",
-        ):
-
+        if st.button("🚪  Log out", use_container_width=True, key="logout_button"):
             logout_user()
             st.rerun()
 
         if st.button(
-            "←  Back to Welcome",
+            "←  Back to welcome",
             use_container_width=True,
             key="back_welcome",
         ):
+            go("landing")
 
-            st.session_state.page = "landing"
-            st.rerun()
-
-        render_html(
-            """
-            <div style="
-                color:rgba(255,255,255,0.40);
-                font-size:11px;
-                text-align:center;
-                margin-top:20px;
-            ">
-                Study Champion AI • v3.0
-            </div>
-            """
-        )
-
-
-
+        render_html('<div class="version">Study Champion AI · v5.0</div>')
 
 
 # ============================================================
@@ -1813,379 +1575,262 @@ def render_sidebar():
 # ============================================================
 
 def render_login():
+    _, toggle_col = st.columns([5, 1])
+    with toggle_col:
+        render_theme_toggle()
 
-    render_html(
-        """
-        <div style="
-            max-width:650px;
-            margin:70px auto 30px auto;
-            background:white;
-            padding:45px;
-            border-radius:25px;
-            text-align:center;
-            border:1px solid #DCE6F2;
-            box-shadow:0 15px 40px rgba(11,31,58,0.12);
-        ">
+    left, right = st.columns([1, 1], gap="large")
 
-            <div style="font-size:55px;">
-                🏆
+    with left:
+        render_html(
+            """
+            <div class="login-brand">
+                <div>
+                    <div class="mark">🏆</div>
+                    <h1>Turn any PDF into a study plan that sticks.</h1>
+                    <p>Upload your notes or textbook. Study Champion builds
+                    the summary, quizzes and flashcards for you.</p>
+                </div>
+                <ul>
+                    <li><span>✓</span>Summaries written from your own material</li>
+                    <li><span>✓</span>Quizzes that track what you get wrong</li>
+                    <li><span>✓</span>Daily streaks to keep you going</li>
+                </ul>
             </div>
-
-            <h1 style="
-                color:#0B1F3A;
-                margin-bottom:8px;
-            ">
-                Study Champion AI
-            </h1>
-
-            <p style="
-                color:#52647A;
-                font-size:16px;
-            ">
-                Your personal AI-powered study companion
-            </p>
-
-        </div>
-        """
-    )
-
-    login_tab, register_tab = st.tabs(
-        ["🔐 Login", "📝 Create Account"]
-    )
-
-    with login_tab:
-
-        st.subheader("Welcome Back")
-
-        username = st.text_input(
-            "Username",
-            key="login_username",
+            """
         )
 
-        password = st.text_input(
-            "Password",
-            type="password",
-            key="login_password",
-        )
+    with right:
+        login_tab, register_tab = st.tabs(["Log in", "Create account"])
 
-        if st.button(
-            "🔐 Login",
-            use_container_width=True,
-            key="login_button",
-        ):
+        with login_tab:
+            st.subheader("Welcome back")
 
-            success, user_id, logged_username = login_user(
-                username,
-                password,
+            username = st.text_input("Username", key="login_username")
+            password = st.text_input(
+                "Password", type="password", key="login_password"
             )
 
-            if success:
-
-                st.session_state.logged_in = True
-                st.session_state.user_id = user_id
-                st.session_state.username = logged_username
-                st.session_state.page = "landing"
-                st.session_state.study_streak = get_study_streak(user_id)
-
-                st.success(
-                    f"Welcome back, {logged_username}! 🎉"
-                )
-
-                st.rerun()
-
-            else:
-
-                st.error(
-                    "Invalid username or password."
-                )
-
-    with register_tab:
-
-        st.subheader("Create Your Account")
-
-        new_username = st.text_input(
-            "Choose a username",
-            key="register_username",
-        )
-
-        new_password = st.text_input(
-            "Create password",
-            type="password",
-            key="register_password",
-        )
-
-        confirm_password = st.text_input(
-            "Confirm password",
-            type="password",
-            key="register_confirm_password",
-        )
-
-        if st.button(
-            "📝 Create Account",
-            use_container_width=True,
-            key="register_button",
-        ):
-
-            if new_password != confirm_password:
-
-                st.error(
-                    "Passwords do not match."
-                )
-
-            else:
-
-                success, message = register_user(
-                    new_username,
-                    new_password,
-                )
+            if st.button(
+                "Log in",
+                use_container_width=True,
+                key="login_button",
+                type="primary",
+            ):
+                success, user_id, logged_username = login_user(username, password)
 
                 if success:
-
-                    st.success(
-                        "Account created successfully! "
-                        "You can now login."
-                    )
-
+                    st.session_state.logged_in = True
+                    st.session_state.user_id = user_id
+                    st.session_state.username = logged_username
+                    st.session_state.page = "landing"
+                    st.session_state.study_streak = get_study_streak(user_id)
+                    st.rerun()
                 else:
+                    st.error("Wrong username or password. Check both and try again.")
 
-                    st.error(message)
+        with register_tab:
+            st.subheader("Create your account")
+
+            new_username = st.text_input("Choose a username", key="register_username")
+            new_password = st.text_input(
+                "Create a password (6+ characters)",
+                type="password",
+                key="register_password",
+            )
+            confirm_password = st.text_input(
+                "Confirm password",
+                type="password",
+                key="register_confirm_password",
+            )
+
+            if st.button(
+                "Create account",
+                use_container_width=True,
+                key="register_button",
+                type="primary",
+            ):
+                if new_password != confirm_password:
+                    st.error("The two passwords don't match.")
+                else:
+                    success, message = register_user(new_username, new_password)
+
+                    if success:
+                        st.success("Account created. You can log in now.")
+                    else:
+                        st.error(message)
+
 
 # ============================================================
 # LANDING
 # ============================================================
 
 def render_landing():
+    landing_background()
 
-    set_background(
-        Path("assets/background.jpg")
-    )
+    _, toggle_col = st.columns([5, 1])
+    with toggle_col:
+        render_theme_toggle()
 
     render_html(
         """
-        <div class="landing">
+        <div class="landing-grid">
+            <div>
+                <span class="landing-pill">AI-powered learning</span>
 
-            <div class="badge">
-                ✦ AI POWERED LEARNING ✦
+                <div class="landing-title">Study Champion 🏆</div>
+
+                <div class="landing-sub">
+                    Your personal study companion. Drop in a PDF and get
+                    summaries, quizzes, flashcards and a plan to finish it.
+                </div>
+
+                <div class="landing-list">
+                    <div><span>●</span>Smart topics</div>
+                    <div><span>●</span>AI summaries</div>
+                    <div><span>●</span>Quizzes with feedback</div>
+                    <div><span>●</span>Flashcards</div>
+                    <div><span>●</span>Study planner</div>
+                    <div><span>●</span>Adaptive learning</div>
+                </div>
             </div>
 
-            <div class="landing-title">
-                STUDY CHAMPION 🏆
+            <div class="mock" aria-hidden="true">
+                <div class="mock-q">
+                    <small>Question 1 of 5</small>
+                    <b>Which organelle produces most of the cell's ATP?</b>
+                    <div class="mock-opt">Ribosome</div>
+                    <div class="mock-opt on">✓ Mitochondria</div>
+                    <div class="mock-opt">Golgi apparatus</div>
+                </div>
+                <div class="mock-card">
+                    <small>Flashcard 3 of 8</small>
+                    <b>What does chlorophyll do?</b>
+                </div>
             </div>
-
-            <div class="landing-subtitle">
-                Your personal AI study companion designed
-                to transform study material into a smarter,
-                simpler and interactive learning experience.
-            </div>
-
-            <div class="chips">
-
-                <span class="chip">
-                    📚 Smart Learning
-                </span>
-
-                <span class="chip">
-                    🧠 AI Assistance
-                </span>
-
-                <span class="chip">
-                    🎯 Progress Tracking
-                </span>
-
-                <span class="chip">
-                    🃏 Flashcards
-                </span>
-
-                <span class="chip">
-                    📝 AI Quiz
-                </span>
-
-                <span class="chip">
-                    📅 Study Planning
-                </span>
-
-                <span class="chip">
-                    🤖 Adaptive Learning
-                </span>
-
-            </div>
-
         </div>
         """
     )
 
-    st.divider()
+    _, middle, _ = st.columns([1, 2, 1])
 
-    col1, col2, col3 = st.columns(
-        [1, 2, 1]
-    )
-
-    with col2:
-
+    with middle:
         if st.button(
-            "START LEARNING →",
+            "Start learning →",
             use_container_width=True,
             key="start_learning",
+            type="primary",
         ):
-
-            st.session_state.page = "home"
-            st.rerun()
+            go("home")
 
 
 # ============================================================
 # DASHBOARD
 # ============================================================
 
-def render_dashboard():
+def render_guided_path():
+    """Five-step path that shows what to do next."""
+    state = st.session_state
 
-    render_html(
-        """
-        <div class="hero">
-
-            <h1>
-                STUDY CHAMPION AI
-            </h1>
-
-            <p>
-                Learn smarter. Stay organized.
-                Turn your study material into
-                intelligent learning content.
-            </p>
-
-        </div>
-        """
-    )
-
-    st.markdown(
-        "### 🚀 Your AI Learning Toolkit"
-    )
-
-    col1, col2, col3, col4, col5 = st.columns(5)
-
-    cards = [
-        ("📚", "TOPICS", "Organize your study material."),
-        ("🧠", "QUIZ", "Test your knowledge with AI."),
-        ("🃏", "FLASHCARDS", "Review concepts quickly."),
-        ("🤖", "ADAPTIVE", "Get personalized learning."),
+    steps = [
+        ("Upload a PDF", state.document_loaded, "home", "Add your material"),
+        ("Find topics", bool(state.topics), "topics", "Spot the key ideas"),
+        ("Read the summary", bool(state.ai_summary), "summary", "Get exam notes"),
+        ("Take a quiz", state.quiz_attempted > 0, "quiz", "Test yourself"),
+        ("Review flashcards", state.flashcards_reviewed > 0, "flashcards", "Lock it in"),
     ]
 
-    for column, card in zip(
-        [col1, col2, col3, col4, col5],
-        cards
-    ):
+    next_index = next((i for i, step in enumerate(steps) if not step[1]), None)
 
-        with column:
+    cells = []
+    for i, (name, done, _, hint) in enumerate(steps):
+        if done:
+            css, dot, label = "done", "✓", "Done"
+        elif i == next_index:
+            css, dot, label = "next", str(i + 1), "Up next"
+        else:
+            css, dot, label = "", str(i + 1), hint
 
-            icon, title, description = card
-
-            render_html(
-                f"""
-                <div class="feature-card">
-
-                    <div class="feature-icon">
-                        {icon}
-                    </div>
-
-                    <h2>
-                        {title}
-                    </h2>
-
-                    <p>
-                        {description}
-                    </p>
-
-                </div>
-                """
-            )
-
-    render_html(
-        """
-        <div class="section-title">
-            📊 Your Learning Workspace
-        </div>
-        """
-    )
-
-    stat1, stat2, stat3, stat4, stat5 = st.columns(5)
-
-    attempted = st.session_state.quiz_attempted
-
-    accuracy = 0
-
-    if attempted > 0:
-
-        accuracy = round(
-            (
-                st.session_state.correct_answers
-                / attempted
-            ) * 100
+        cells.append(
+            f"""
+            <div class="step {css}">
+                <div class="step-dot">{dot}</div>
+                <div class="step-name">{esc(name)}</div>
+                <div class="step-state">{esc(label)}</div>
+            </div>
+            """
         )
 
-    stats = [
-        (
-            len(st.session_state.chunks),
-            "Study Chunks"
-        ),
-        (
-            attempted,
-            "Questions Attempted"
-        ),
-        (
-            f"{accuracy}%",
-            "Quiz Accuracy"
-        ),
-        (
-            st.session_state.flashcards_reviewed,
-            "Cards Reviewed"
-        ),
-        (
-          f"🔥 {st.session_state.study_streak}",
-           "Study Streak"
-      ),
-    ]
+    section_title("Your study path")
+    render_html(f'<div class="steps">{"".join(cells)}</div>')
 
-    for column, stat in zip(
-        [stat1, stat2, stat3, stat4 , stat5],
-        stats
-    ):
+    if next_index is None:
+        st.success("You've completed every step. Keep your streak alive tomorrow! 🔥")
 
-        with column:
+    elif next_index > 0:
+        name, _, page, _ = steps[next_index]
 
-            number, label = stat
+        st.write("")
+        if st.button(
+            f"Continue: {name} →",
+            key="continue_path",
+            type="primary",
+        ):
+            go(page)
 
-            render_html(
-                f"""
-                <div class="stat-card">
 
-                    <div class="stat-number">
-                        {number}
-                    </div>
-
-                    <div class="stat-label">
-                        {label}
-                    </div>
-
-                </div>
-                """
-            )
-
-    # ========================================================
-    # UPLOAD
-    # ========================================================
+def render_dashboard():
+    render_html(
+        f"""
+        <div class="banner">
+            <div>
+                <h1>Hi {esc(st.session_state.username)}, ready to study?</h1>
+                <p>Upload your material, follow the path below, and test
+                yourself until it sticks.</p>
+            </div>
+            <div class="streak">
+                <b>🔥 {st.session_state.study_streak}</b>
+                <span>day streak</span>
+            </div>
+        </div>
+        """
+    )
 
     render_html(
+        f"""
+        <div class="strip">
+            <div class="strip-item">
+                <div class="strip-num">{len(st.session_state.chunks)}</div>
+                <div class="strip-label">Study chunks</div>
+            </div>
+            <div class="strip-item">
+                <div class="strip-num">{st.session_state.quiz_attempted}</div>
+                <div class="strip-label">Questions attempted</div>
+            </div>
+            <div class="strip-item">
+                <div class="strip-num">{accuracy_percent()}%</div>
+                <div class="strip-label">Quiz accuracy</div>
+            </div>
+            <div class="strip-item">
+                <div class="strip-num">{st.session_state.flashcards_reviewed}</div>
+                <div class="strip-label">Cards reviewed</div>
+            </div>
+            <div class="strip-item">
+                <div class="strip-num">{st.session_state.study_streak}</div>
+                <div class="strip-label">Day streak</div>
+            </div>
+        </div>
         """
-        <div class="upload-box">
+    )
 
-            <h1>
-                📚 Upload Your Study Material
-            </h1>
+    render_guided_path()
 
-            <p>
-                Upload a PDF and unlock AI-powered
-                learning tools.
-            </p>
-
+    # ---------------- Upload ----------------
+    render_html(
+        """
+        <div class="upload-intro">
+            <h2>Upload your study material</h2>
+            <p>Add a PDF to unlock topics, summaries, quizzes and flashcards.</p>
         </div>
         """
     )
@@ -2195,81 +1840,76 @@ def render_dashboard():
         type=["pdf"],
         help="Upload a PDF study material.",
         key="pdf_uploader",
+        label_visibility="collapsed",
     )
 
     if uploaded_file is not None:
-
         if (
             not st.session_state.document_loaded
-            or st.session_state.file_name
-            != uploaded_file.name
+            or st.session_state.file_name != uploaded_file.name
         ):
+            if process_pdf(uploaded_file):
+                st.rerun()
 
-            process_pdf(
-                uploaded_file
-            )
-
-    # ========================================================
-    # DOCUMENT INFORMATION
-    # ========================================================
-
+    # ---------------- Document info ----------------
     if st.session_state.document_loaded:
+        section_title("📄 Your document")
 
         render_html(
-            """
-            <div class="section-title">
-                📄 Document Information
+            f"""
+            <div class="doc-card">
+                <div class="doc-name">{esc(st.session_state.file_name)}</div>
+                <div class="doc-stat">
+                    <b>{len(st.session_state.cleaned_text):,}</b>
+                    <span>characters</span>
+                </div>
+                <div class="doc-stat">
+                    <b>{len(st.session_state.chunks)}</b>
+                    <span>chunks</span>
+                </div>
             </div>
             """
         )
 
-        c1, c2, c3 = st.columns(3)
-
-        with c1:
-
-            st.metric(
-                "Characters",
-                f"{len(st.session_state.cleaned_text):,}"
-            )
-
-        with c2:
-
-            st.metric(
-                "Chunks",
-                len(st.session_state.chunks)
-            )
-
-        with c3:
-
-            st.metric(
-                "Document",
-                st.session_state.file_name
-            )
-
-        render_html(
-            """
-            <div class="section-title">
-                📖 Generated Study Content
-            </div>
-            """
-        )
-
-        for i, chunk in enumerate(
-            st.session_state.chunks[:10]
-        ):
-
-            with st.expander(
-                f"Chunk {i + 1}"
-            ):
-
+        with st.expander("Browse study chunks"):
+            for i, chunk in enumerate(st.session_state.chunks[:10]):
+                st.markdown(f"**Chunk {i + 1}**")
                 st.write(chunk)
+                st.divider()
 
-        if len(st.session_state.chunks) > 10:
+            if len(st.session_state.chunks) > 10:
+                st.info(
+                    f"{len(st.session_state.chunks) - 10} more chunks are "
+                    "available to the AI but not shown here."
+                )
 
-            st.info(
-                f"{len(st.session_state.chunks) - 10} "
-                "additional chunks are available for AI processing."
+    # ---------------- Toolkit ----------------
+    section_title("Your toolkit")
+
+    tools = [
+        ("📚", "Topics", "Find the main ideas in your material.", "topics"),
+        ("📝", "AI Summary", "Get exam-ready notes you can download.", "summary"),
+        ("🧠", "Quiz", "Test yourself on any topic.", "quiz"),
+        ("🃏", "Flashcards", "Review key concepts quickly.", "flashcards"),
+    ]
+
+    for column, (icon, title, description, page) in zip(st.columns(4), tools):
+        with column:
+            render_html(
+                f"""
+                <div class="tool">
+                    <div class="tool-icon">{icon}</div>
+                    <h3>{title}</h3>
+                    <p>{description}</p>
+                </div>
+                """
             )
+            if st.button(
+                f"Open {title}",
+                key=f"tool_{page}",
+                use_container_width=True,
+            ):
+                go(page)
 
 
 # ============================================================
@@ -2277,111 +1917,115 @@ def render_dashboard():
 # ============================================================
 
 def render_topics():
-
-    render_html(
-        """
-        <div class="section-title">
-            📚 Study Topics
-        </div>
-        """
-    )
+    page_header("📚", "Study topics", "The main ideas found in your material.")
 
     if not st.session_state.document_loaded:
-
-        st.info(
-            "Upload a PDF from Dashboard first."
-        )
-
+        need_document()
         return
 
-    st.write(
-        f"Current document: **{st.session_state.file_name}**"
-    )
+    st.write(f"Current document: **{st.session_state.file_name}**")
 
     if st.button(
-        "✨ Generate AI Topics",
+        "✨ Find topics with AI",
         use_container_width=True,
         key="generate_topics",
+        type="primary",
     ):
-
-        with st.spinner(
-            "AI is analyzing your study material..."
-        ):
-
+        with st.spinner("Reading through your material..."):
             topics = generate_topics()
 
         if topics:
-
             st.session_state.topics = topics
-
             st.session_state.topics_generated = True
-
-            st.success(
-                f"{len(topics)} topics generated successfully."
-            )
-
+            st.success(f"Found {len(topics)} topics.")
         else:
-
-            st.error(
-                "Could not generate topics. Please try again."
-            )
+            st.error("We couldn't find topics this time. Please try again.")
 
     if st.session_state.topics:
+        section_title("Detected topics")
 
-        render_html(
-            """
-            <div class="section-title">
-                🎯 Detected Topics
-            </div>
-            """
-        )
-
-        for i, topic in enumerate(
-            st.session_state.topics
-        ):
-
-            col1, col2 = st.columns(
-                [4, 1]
-            )
+        for i, topic in enumerate(st.session_state.topics):
+            col1, col2, col3 = st.columns([5, 1.2, 1.4], vertical_alignment="center")
 
             with col1:
-
                 render_html(
                     f"""
-                    <div class="info-card">
-
-                        <h3>
-                            📘 {topic}
-                        </h3>
-
-                        <p>
-                            Topic {i + 1} from your
-                            uploaded study material.
-                        </p>
-
+                    <div class="topic-card">
+                        <div class="topic-num">{i + 1}</div>
+                        <div class="topic-name">{esc(topic)}</div>
                     </div>
                     """
                 )
 
             with col2:
+                if st.button("Quiz me", key=f"quiz_topic_{i}", use_container_width=True):
+                    go("quiz", quiz_topic_select=topic, selected_topic=topic)
 
-                if st.button(
-                    "Study",
-                    key=f"study_topic_{i}",
-                    use_container_width=True,
-                ):
-
-                    st.session_state.selected_topic = topic
-
-                    st.session_state.page = "quiz"
-
-                    st.rerun()
-
+            with col3:
+                if st.button("Flashcards", key=f"cards_topic_{i}", use_container_width=True):
+                    go("flashcards", flashcard_topic_select=topic, selected_topic=topic)
     else:
+        st.info("Select “Find topics with AI” to analyze your PDF.")
 
-        st.info(
-            "Click 'Generate AI Topics' to analyze your PDF."
-        )
+
+# ============================================================
+# SUMMARY
+# ============================================================
+
+def render_summary():
+    page_header("📝", "AI summary", "Exam-ready notes written from your material.")
+
+    if not st.session_state.document_loaded:
+        need_document()
+        return
+
+    st.write(f"Current document: **{st.session_state.file_name}**")
+
+    if st.button(
+        "✨ Write my summary",
+        use_container_width=True,
+        key="generate_ai_summary",
+        type="primary",
+    ):
+        with st.spinner("Writing your study summary..."):
+            summary = generate_ai_summary()
+
+        if summary:
+            st.session_state.ai_summary = summary
+            record_study_activity()
+            st.success("Your summary is ready.")
+        else:
+            st.error("We couldn't write the summary this time. Please try again.")
+
+    if st.session_state.ai_summary:
+        section_title("Your summary")
+
+        with st.container(border=True):
+            st.markdown(st.session_state.ai_summary)
+
+        section_title("Download your notes")
+
+        d1, d2 = st.columns(2)
+
+        with d1:
+            st.download_button(
+                label="📄 Download as TXT",
+                data=st.session_state.ai_summary,
+                file_name="study_champion_summary.txt",
+                mime="text/plain",
+                use_container_width=True,
+                key="download_summary_txt",
+            )
+
+        with d2:
+            st.download_button(
+                label="📝 Download as Markdown",
+                data=st.session_state.ai_summary,
+                file_name="study_champion_summary.md",
+                mime="text/markdown",
+                use_container_width=True,
+                key="download_summary_md",
+            )
 
 
 # ============================================================
@@ -2389,365 +2033,318 @@ def render_topics():
 # ============================================================
 
 def render_quiz():
-
-    render_html(
-        """
-        <div class="section-title">
-            🧠 AI Quiz Center
-        </div>
-        """
-    )
+    page_header("🧠", "Quiz", "Test what you know, then see where to improve.")
 
     if not st.session_state.document_loaded:
-
-        st.info(
-            "Upload a PDF from Dashboard first."
-        )
-
+        need_document()
         return
 
-    topics = st.session_state.topics
+    topic_options = ["All Topics"] + list(st.session_state.topics)
 
-    topic_options = [
-        "All Topics"
-    ]
+    # keep a stale selection (e.g. after a reset) from breaking the selectbox
+    if st.session_state.get("quiz_topic_select") not in topic_options:
+        st.session_state["quiz_topic_select"] = "All Topics"
 
-    topic_options.extend(topics)
+    col1, col2 = st.columns([3, 2])
 
-    selected = st.selectbox(
-        "Quiz topic",
-        topic_options,
-        index=0,
-        key="quiz_topic_select",
-    )
+    with col1:
+        selected = st.selectbox("Quiz topic", topic_options, key="quiz_topic_select")
 
-    selected_topic = (
-        None
-        if selected == "All Topics"
-        else selected
-    )
+    with col2:
+        number_of_questions = st.slider(
+            "Number of questions",
+            min_value=3,
+            max_value=10,
+            value=5,
+            key="quiz_question_count",
+        )
 
-    number_of_questions = st.slider(
-        "Number of questions",
-        min_value=3,
-        max_value=10,
-        value=5,
-        key="quiz_question_count",
-    )
+    selected_topic = None if selected == "All Topics" else selected
 
     if st.button(
-        "🧠 Generate Quiz",
+        "🧠 Generate quiz",
         use_container_width=True,
         key="generate_quiz",
+        type="primary",
     ):
-
-        with st.spinner(
-            "Generating your AI quiz..."
-        ):
-
-            questions = generate_quiz(
-                selected_topic,
-                number_of_questions
-            )
+        with st.spinner("Writing your questions..."):
+            questions = generate_quiz(selected_topic, number_of_questions)
 
         if questions:
-
             st.session_state.quiz_questions = questions
-
             st.session_state.quiz_score = 0
-
             st.session_state.quiz_submitted = False
-
             st.session_state.quiz_generated = True
-
-            st.success(
-                f"{len(questions)} questions generated."
-            )
-
+            st.session_state.quiz_id += 1
+            st.rerun()
         else:
-
-            st.error(
-                "Quiz generation failed. Please try again."
-            )
+            st.error("Quiz generation failed. Please try again.")
 
     questions = st.session_state.quiz_questions
 
     if not questions:
         return
 
-    render_html(
-        """
-        <div class="section-title">
-            📝 Test Your Knowledge
-        </div>
-        """
+    quiz_id = st.session_state.quiz_id
+    submitted = st.session_state.quiz_submitted
+    total = len(questions)
+
+    answered = sum(
+        1
+        for i in range(total)
+        if st.session_state.get(f"quiz_answer_{quiz_id}_{i}") is not None
     )
 
-    answers = {}
+    # ---------------- Results ----------------
+    if submitted:
+        score = st.session_state.quiz_score
+        percentage = round((score / total) * 100)
 
-    for i, question in enumerate(
-        questions
-    ):
+        if percentage >= 80:
+            verdict = "Excellent work. You know this material."
+        elif percentage >= 60:
+            verdict = "Good progress. A bit more practice will lock it in."
+        else:
+            verdict = "Review the material below and try another quiz."
 
         render_html(
             f"""
-            <div class="quiz-card">
-
-                <div class="question-number">
-                    QUESTION {i + 1}
+            <div class="score-card">
+                <div class="score-big">{score}/{total}</div>
+                <div>
+                    <p>{percentage}% correct</p>
+                    <small>{verdict}</small>
                 </div>
-
-                <div class="question-text">
-                    {question["question"]}
-                </div>
-
             </div>
             """
         )
 
-        answers[i] = st.radio(
-            f"Choose your answer for Question {i + 1}",
-            question["options"],
-            key=f"quiz_answer_{i}",
-        )
+        section_title("Review your answers")
 
-    if st.button(
-        "✅ Submit Quiz",
-        use_container_width=True,
-        key="submit_quiz",
-    ):
+        for i, question in enumerate(questions):
+            given = st.session_state.get(f"quiz_answer_{quiz_id}_{i}")
+            is_right = given == question["answer"]
+            css_class = "good" if is_right else "bad"
+            mark = "✓ Correct" if is_right else "✗ Not quite"
 
-        score = 0
+            explanation = (
+                f'<div class="why">{esc(question["explanation"])}</div>'
+                if question.get("explanation")
+                else ""
+            )
+            your_answer = "" if is_right else f"<div>Your answer: {esc(given)}</div>"
 
-        for i, question in enumerate(
-            questions
-        ):
+            render_html(
+                f"""
+                <div class="review {css_class}">
+                    <b>{i + 1}. {mark}</b>
+                    <div>{esc(question["question"])}</div>
+                    {your_answer}
+                    <div>Correct answer: <b>{esc(question["answer"])}</b></div>
+                    {explanation}
+                </div>
+                """
+            )
 
-            if answers.get(i) == question["answer"]:
-                score += 1
-
-        total = len(questions)
-
-        st.session_state.quiz_score = score
-
-        st.session_state.quiz_attempted += total
-
-        st.session_state.correct_answers += score
-
-        st.session_state.wrong_answers += (
-            total - score
-        )
-
-        st.session_state.quiz_submitted = True
-        record_study_activity()
-
-        st.success(
-            f"Quiz completed! Score: {score}/{total}"
-        )
-
-    if st.session_state.quiz_submitted:
-
-        score = st.session_state.quiz_score
-
-        total = len(questions)
-
-        percentage = round(
-            (score / total) * 100
-        )
-
-        st.progress(
-            percentage / 100
-        )
-
-        st.write(
-            f"### Score: {score}/{total} ({percentage}%)"
-        )
-
-        for i, question in enumerate(
-            questions
-        ):
-
-            with st.expander(
-                f"Question {i + 1} Explanation"
-            ):
-
-                st.write(
-                    f"**Correct answer:** "
-                    f"{question['answer']}"
-                )
-
-                if question.get(
-                    "explanation"
-                ):
-
-                    st.write(
-                        question["explanation"]
-                    )
-
-
-# ============================================================
-# FLASHCARDS
-# ============================================================
-
-def render_flashcards():
-
-    render_html(
-        """
-        <div class="section-title">
-            🃏 Flashcard Generator
-        </div>
-        """
-    )
-
-    if not st.session_state.document_loaded:
-
-        st.info(
-            "Upload a PDF from Dashboard first."
-        )
+        st.write("")
+        if st.button("Try another quiz", key="another_quiz", type="primary"):
+            st.session_state.quiz_questions = []
+            st.session_state.quiz_submitted = False
+            st.rerun()
 
         return
 
-    topics = st.session_state.topics
+    # ---------------- Taking the quiz ----------------
+    section_title("Answer the questions")
+    st.progress(answered / total, text=f"{answered} of {total} answered")
 
-    options = [
-        "All Topics"
-    ]
+    for i, question in enumerate(questions):
+        render_html(
+            f"""
+            <div class="q-card">
+                <div class="q-index">Question {i + 1} of {total}</div>
+                <div class="q-text">{esc(question["question"])}</div>
+            </div>
+            """
+        )
 
-    options.extend(topics)
+        st.radio(
+            f"Answer for question {i + 1}",
+            question["options"],
+            index=None,
+            key=f"quiz_answer_{quiz_id}_{i}",
+            label_visibility="collapsed",
+        )
 
-    selected = st.selectbox(
-        "Flashcard topic",
-        options,
-        key="flashcard_topic_select",
-    )
-
-    selected_topic = (
-        None
-        if selected == "All Topics"
-        else selected
-    )
-
-    card_count = st.slider(
-        "Number of flashcards",
-        min_value=5,
-        max_value=15,
-        value=8,
-        key="flashcard_count",
-    )
+    st.write("")
 
     if st.button(
-        "🃏 Generate Flashcards",
+        "✅ Submit quiz",
+        use_container_width=True,
+        key="submit_quiz",
+        type="primary",
+    ):
+        answers = [
+            st.session_state.get(f"quiz_answer_{quiz_id}_{i}")
+            for i in range(total)
+        ]
+
+        if any(answer is None for answer in answers):
+            st.warning("Answer every question before submitting.")
+        else:
+            score = sum(
+                1
+                for answer, question in zip(answers, questions)
+                if answer == question["answer"]
+            )
+
+            st.session_state.quiz_score = score
+            st.session_state.quiz_attempted += total
+            st.session_state.correct_answers += score
+            st.session_state.wrong_answers += total - score
+            st.session_state.quiz_submitted = True
+            record_study_activity()
+            st.rerun()
+
+
+# ============================================================
+# FLASHCARDS (one card at a time)
+# ============================================================
+
+def render_flashcards():
+    page_header("🃏", "Flashcards", "Flip through key ideas and mark what you've learned.")
+
+    if not st.session_state.document_loaded:
+        need_document()
+        return
+
+    options = ["All Topics"] + list(st.session_state.topics)
+
+    if st.session_state.get("flashcard_topic_select") not in options:
+        st.session_state["flashcard_topic_select"] = "All Topics"
+
+    col1, col2 = st.columns([3, 2])
+
+    with col1:
+        selected = st.selectbox("Flashcard topic", options, key="flashcard_topic_select")
+
+    with col2:
+        card_count = st.slider(
+            "Number of flashcards",
+            min_value=5,
+            max_value=15,
+            value=8,
+            key="flashcard_count",
+        )
+
+    selected_topic = None if selected == "All Topics" else selected
+
+    if st.button(
+        "🃏 Generate flashcards",
         use_container_width=True,
         key="generate_flashcards",
+        type="primary",
     ):
-
-        with st.spinner(
-            "Creating your flashcards..."
-        ):
-
-            cards = generate_flashcards(
-                selected_topic,
-                card_count
-            )
+        with st.spinner("Creating your flashcards..."):
+            cards = generate_flashcards(selected_topic, card_count)
 
         if cards:
-
             st.session_state.flashcards = cards
-
             st.session_state.flashcards_generated = True
-
-            st.success(
-                f"{len(cards)} flashcards generated."
-            )
-
+            st.session_state.flashcard_id += 1
+            st.session_state.fc_index = 0
+            st.session_state.fc_show = False
+            st.rerun()
         else:
-
-            st.error(
-                "Flashcard generation failed. Please try again."
-            )
+            st.error("Flashcard generation failed. Please try again.")
 
     cards = st.session_state.flashcards
 
     if not cards:
         return
 
-    render_html(
-        """
-        <div class="section-title">
-            📖 Review Your Flashcards
-        </div>
-        """
+    card_set = st.session_state.flashcard_id
+    total = len(cards)
+    index = max(0, min(st.session_state.fc_index, total - 1))
+    st.session_state.fc_index = index
+    card = cards[index]
+    showing_answer = st.session_state.fc_show
+
+    reviewed_count = sum(
+        1 for i in range(total) if st.session_state.get(f"reviewed_{card_set}_{i}", False)
     )
 
-    for i, card in enumerate(
-        cards
-    ):
+    section_title(f"Card {index + 1} of {total}")
+    st.progress(reviewed_count / total, text=f"{reviewed_count} of {total} reviewed")
 
-        with st.container():
+    if showing_answer:
+        render_html(
+            f"""
+            <div class="flash back">
+                <small>Answer</small>
+                <div class="flash-text">{esc(card["answer"])}</div>
+                <div class="flash-q">Q: {esc(card["question"])}</div>
+            </div>
+            """
+        )
+    else:
+        render_html(
+            f"""
+            <div class="flash">
+                <small>Question</small>
+                <div class="flash-text">{esc(card["question"])}</div>
+            </div>
+            """
+        )
 
-            render_html(
-                f"""
-                <div class="flashcard">
+    prev_col, flip_col, next_col = st.columns([1, 2, 1])
 
-                    <div class="flashcard-label">
-                        Flashcard {i + 1}
-                    </div>
+    with prev_col:
+        if st.button(
+            "← Previous",
+            key="fc_prev",
+            use_container_width=True,
+            disabled=index == 0,
+        ):
+            st.session_state.fc_index = index - 1
+            st.session_state.fc_show = False
+            st.rerun()
 
-                    <div class="flashcard-question">
-                        {card["question"]}
-                    </div>
+    with flip_col:
+        if st.button(
+            "Hide answer" if showing_answer else "Show answer",
+            key="fc_flip",
+            use_container_width=True,
+            type="primary",
+        ):
+            st.session_state.fc_show = not showing_answer
+            st.rerun()
 
-                </div>
-                """
-            )
+    with next_col:
+        if st.button(
+            "Next →",
+            key="fc_next",
+            use_container_width=True,
+            disabled=index == total - 1,
+        ):
+            st.session_state.fc_index = index + 1
+            st.session_state.fc_show = False
+            st.rerun()
 
-            if st.toggle(
-                "Show Answer",
-                key=f"show_card_{i}",
-            ):
+    review_key = f"reviewed_{card_set}_{index}"
 
-                render_html(
-                    f"""
-                    <div class="answer-box">
+    if st.session_state.get(review_key, False):
+        st.success("You've reviewed this card ✓")
 
-                        <strong>
-                            Answer:
-                        </strong>
+    elif showing_answer:
+        if st.button("✓ Mark as reviewed", key=f"review_card_{card_set}_{index}"):
+            st.session_state["flashcards_reviewed"] += 1
+            st.session_state[review_key] = True
+            record_study_activity()
+            st.rerun()
 
-                        <br><br>
-
-                        {card["answer"]}
-
-                    </div>
-                    """
-                )
-
-                if st.button(
-                    "✓ Mark Reviewed",
-                    key=f"review_card_{i}",
-                ):
-
-                    review_key = (
-                        f"reviewed_{i}"
-                    )
-
-                    if not st.session_state.get(
-                        review_key,
-                        False
-                    ):
-
-                        st.session_state[
-                            "flashcards_reviewed"
-                        ] += 1
-                        record_study_activity()
-
-                        st.session_state[
-                            review_key
-                        ] = True
-
-                        st.success(
-                            "Flashcard marked as reviewed."
-                        )
+    else:
+        st.caption("Think of your answer first, then reveal it.")
 
 
 # ============================================================
@@ -2755,23 +2352,11 @@ def render_flashcards():
 # ============================================================
 
 def render_planner():
-
-    render_html(
-        """
-        <div class="section-title">
-            📅 Personalized Study Planner
-        </div>
-        """
-    )
-
-    st.write(
-        "Create a practical study schedule based on your available time."
-    )
+    page_header("📅", "Study planner", "Spread your material across the days you have.")
 
     col1, col2 = st.columns(2)
 
     with col1:
-
         days = st.number_input(
             "Days available",
             min_value=1,
@@ -2782,7 +2367,6 @@ def render_planner():
         )
 
     with col2:
-
         hours = st.number_input(
             "Study hours per day",
             min_value=0.5,
@@ -2799,123 +2383,75 @@ def render_planner():
     )
 
     if st.button(
-        "📅 Create Study Plan",
+        "📅 Create study plan",
         use_container_width=True,
         key="create_plan",
+        type="primary",
     ):
-
         plan = []
+        total_chunks = len(st.session_state.chunks)
 
-        total_chunks = len(
-            st.session_state.chunks
-        )
-
-        for day in range(
-            1,
-            int(days) + 1
-        ):
-
+        for day in range(1, int(days) + 1):
             if total_chunks > 0:
-
-                start = int(
-                    (day - 1)
-                    * total_chunks
-                    / days
-                )
-
-                end = int(
-                    day
-                    * total_chunks
-                    / days
-                )
-
-                chunk_text_label = (
-                    f"Chunks {start + 1}-{max(start + 1, end)}"
-                )
-
+                start = int((day - 1) * total_chunks / days)
+                end = int(day * total_chunks / days)
+                material_label = f"Chunks {start + 1}–{max(start + 1, end)}"
             else:
-
-                chunk_text_label = (
-                    "General revision"
-                )
+                material_label = "General revision"
 
             plan.append(
                 {
                     "day": day,
                     "hours": hours,
                     "goal": focus,
-                    "material": chunk_text_label,
+                    "material": material_label,
                 }
             )
 
         st.session_state.study_plan = plan
-
         st.session_state.planner_created = True
-
-        st.success(
-            "Study plan created successfully!"
-        )
+        st.success("Your study plan is ready.")
 
     if st.session_state.study_plan:
+        section_title("Your schedule")
 
-        render_html(
-            """
-            <div class="section-title">
-                🗓️ Your Study Schedule
-            </div>
-            """
-        )
-
-        for item in (
-            st.session_state.study_plan
-        ):
-
+        for item in st.session_state.study_plan:
             render_html(
                 f"""
                 <div class="plan-day">
-
-                    <h3>
-                        Day {item["day"]}
-                    </h3>
-
-                    <p>
-                        ⏱️ {item["hours"]} hours
-                    </p>
-
-                    <p>
-                        🎯 {item["goal"]}
-                    </p>
-
-                    <p>
-                        📚 {item["material"]}
-                    </p>
-
+                    <div class="plan-badge">
+                        <small>Day</small>
+                        <b>{item["day"]}</b>
+                    </div>
+                    <div class="plan-body">
+                        <div class="goal">{esc(item["goal"])}</div>
+                        <div class="meta">
+                            ⏱️ {item["hours"]:g} hours · 📚 {esc(item["material"])}
+                        </div>
+                    </div>
                 </div>
                 """
             )
 
-        total_hours = sum(
-            float(item["hours"])
-            for item in st.session_state.study_plan
-        )
+        total_hours = sum(float(item["hours"]) for item in st.session_state.study_plan)
 
-        st.metric(
-            "Total Planned Study Time",
-            f"{total_hours:g} hours"
-        )
+        m1, m2 = st.columns(2)
+
+        with m1:
+            st.metric("Total planned study time", f"{total_hours:g} hours")
+
+        with m2:
+            st.metric("Logged so far", f"{st.session_state.study_minutes} min")
 
         if st.button(
-            "✅ Mark 30 Minutes Studied",
+            "✅ Log 30 minutes studied",
             use_container_width=True,
             key="mark_study_time",
         ):
-
             st.session_state.study_minutes += 30
             record_study_activity()
-
-            st.success(
-                "30 minutes added to your progress."
-            )
+            st.success("Added 30 minutes to your progress.")
+            st.rerun()
 
 
 # ============================================================
@@ -2923,348 +2459,180 @@ def render_planner():
 # ============================================================
 
 def render_adaptive():
+    page_header("🤖", "Adaptive learning", "Advice based on how you're actually doing.")
 
-    render_html(
-        """
-        <div class="section-title">
-            🤖 Adaptive Learning
-        </div>
-        """
-    )
+    level, level_text = learning_level()
 
-    attempted = (
-        st.session_state.quiz_attempted
-    )
+    left, right = st.columns([1, 1.4], gap="large")
 
-    correct = (
-        st.session_state.correct_answers
-    )
-
-    if attempted > 0:
-
-        accuracy = round(
-            (correct / attempted) * 100
+    with left:
+        render_html(
+            f"""
+            <div class="panel">
+                <h3>Your current level</h3>
+                <div class="ring-wrap">
+                    {ring_svg(accuracy_percent())}
+                    <div>
+                        <span class="level">{esc(level)}</span>
+                        <p class="level-text">{esc(level_text)}</p>
+                    </div>
+                </div>
+            </div>
+            """
         )
 
-    else:
+    with right:
+        c1, c2 = st.columns(2)
 
-        accuracy = 0
+        with c1:
+            st.metric("Questions attempted", st.session_state.quiz_attempted)
 
-    render_html(
-        f"""
-        <div class="info-card">
+        with c2:
+            st.metric("Flashcards reviewed", st.session_state.flashcards_reviewed)
 
-            <h3>
-                🧠 Your Current Learning Level
-            </h3>
+        st.write("")
 
-            <p>
-                Quiz Accuracy:
-                <strong>{accuracy}%</strong>
-            </p>
-
-            <p>
-                Questions Attempted:
-                <strong>{attempted}</strong>
-            </p>
-
-            <p>
-                Flashcards Reviewed:
-                <strong>
-                    {st.session_state.flashcards_reviewed}
-                </strong>
-            </p>
-
-        </div>
-        """
-    )
-
-    if st.button(
-        "🤖 Analyze My Learning",
-        use_container_width=True,
-        key="analyze_learning",
-    ):
-
-        recommendations = (
-            generate_adaptive_recommendations()
-        )
-
-        st.session_state.adaptive_recommendations = (
-            recommendations
-        )
+        if st.button(
+            "🤖 Analyze my learning",
+            use_container_width=True,
+            key="analyze_learning",
+            type="primary",
+        ):
+            st.session_state.adaptive_recommendations = (
+                generate_adaptive_recommendations()
+            )
 
     if st.session_state.adaptive_recommendations:
+        section_title("Recommended next steps")
 
-        render_html(
-            """
-            <div class="section-title">
-                🎯 Personalized Recommendations
-            </div>
-            """
-        )
-
-        for recommendation in (
-            st.session_state.adaptive_recommendations
-        ):
-
-            st.success(
-                recommendation
-            )
-
+        for recommendation in st.session_state.adaptive_recommendations:
+            render_html(f'<div class="insight">{esc(recommendation)}</div>')
     else:
-
+        st.write("")
         st.info(
-            "Complete a quiz or review flashcards, "
-            "then click Analyze My Learning."
+            "Finish a quiz or review some flashcards, "
+            "then select “Analyze my learning”."
         )
 
-def render_summary():
 
-    render_html(
-        """
-        <div class="section-title">
-            📝 AI Study Summary
-        </div>
-        """
-    )
-
-    if not st.session_state.document_loaded:
-
-        st.info(
-            "Upload a PDF from Dashboard first."
-        )
-
-        return
-
-    st.write(
-        f"Current document: "
-        f"**{st.session_state.file_name}**"
-    )
-
-    if st.button(
-        "✨ Generate AI Summary",
-        use_container_width=True,
-        key="generate_ai_summary",
-    ):
-
-        with st.spinner(
-            "AI is creating your study summary..."
-        ):
-
-            summary = generate_ai_summary()
-
-        if summary:
-
-            st.session_state.ai_summary = summary
-
-            record_study_activity()
-
-            st.success(
-                "AI summary generated successfully! 🎉"
-            )
-
-        else:
-
-            st.error(
-                "Could not generate the summary. "
-                "Please try again."
-            )
-
-    if st.session_state.ai_summary:
-
-        render_html(
-            """
-            <div class="section-title">
-                📖 Your AI Summary
-            </div>
-            """
-        )
-
-        st.markdown(
-            st.session_state.ai_summary
-        )
-
-        st.divider()
-
-        st.subheader(
-            "📥 Download Summary Notes"
-        )
-
-        st.download_button(
-            label="📄 Download as TXT",
-            data=st.session_state.ai_summary,
-            file_name="study_champion_summary.txt",
-            mime="text/plain",
-            use_container_width=True,
-            key="download_summary_txt",
-        )
-
-        st.download_button(
-            label="📝 Download as Markdown",
-            data=st.session_state.ai_summary,
-            file_name="study_champion_summary.md",
-            mime="text/markdown",
-            use_container_width=True,
-            key="download_summary_md",
-        )
 # ============================================================
 # PROGRESS
 # ============================================================
 
+def render_week_dots():
+    active_days = get_week_activity(st.session_state.user_id)
+    today = date.today()
+    cells = []
+
+    for offset in range(6, -1, -1):
+        day = today - timedelta(days=offset)
+        classes = ["day"]
+
+        if day.isoformat() in active_days:
+            classes.append("on")
+        if day == today:
+            classes.append("today")
+
+        mark = "✓" if day.isoformat() in active_days else ""
+        cells.append(
+            f"""
+            <div class="{' '.join(classes)}">
+                <div class="dot">{mark}</div>
+                <small>{day.strftime('%a')}</small>
+            </div>
+            """
+        )
+
+    return f'<div class="week">{"".join(cells)}</div>'
+
+
 def render_progress():
+    page_header("🎯", "Progress", "See how your studying is adding up.")
 
-    render_html(
-        """
-        <div class="section-title">
-            🎯 Progress Dashboard
-        </div>
-        """
-    )
+    attempted = st.session_state.quiz_attempted
+    correct = st.session_state.correct_answers
+    wrong = st.session_state.wrong_answers
+    accuracy = accuracy_percent()
+    level, level_text = learning_level()
 
-    attempted = (
-        st.session_state.quiz_attempted
-    )
+    correct_pct = round(correct / attempted * 100) if attempted else 0
+    wrong_pct = round(wrong / attempted * 100) if attempted else 0
 
-    correct = (
-        st.session_state.correct_answers
-    )
+    left, right = st.columns(2, gap="large")
 
-    wrong = (
-        st.session_state.wrong_answers
-    )
-
-    if attempted > 0:
-
-        accuracy = round(
-            (correct / attempted) * 100
+    with left:
+        render_html(
+            f"""
+            <div class="panel">
+                <h3>Quiz accuracy</h3>
+                <div class="ring-wrap">
+                    {ring_svg(accuracy)}
+                    <div>
+                        <span class="level">{esc(level)}</span>
+                        <p class="level-text">{esc(level_text)}</p>
+                    </div>
+                </div>
+            </div>
+            """
         )
 
-    else:
-
-        accuracy = 0
-
-    col1, col2, col3, col4 = st.columns(4)
-
-    with col1:
-
-        st.metric(
-            "Questions Attempted",
-            attempted
+    with right:
+        render_html(
+            f"""
+            <div class="panel">
+                <h3>Answers breakdown</h3>
+                <div class="bar-row">
+                    <span>Correct</span>
+                    <div class="bar"><i style="width:{correct_pct}%;background:var(--good)"></i></div>
+                    <b>{correct}</b>
+                </div>
+                <div class="bar-row">
+                    <span>Wrong</span>
+                    <div class="bar"><i style="width:{wrong_pct}%;background:var(--bad)"></i></div>
+                    <b>{wrong}</b>
+                </div>
+                <h3 style="margin-top:26px">Last 7 days</h3>
+                {render_week_dots()}
+            </div>
+            """
         )
 
-    with col2:
+    section_title("Learning activity")
 
-        st.metric(
-            "Correct",
-            correct
-        )
-
-    with col3:
-
-        st.metric(
-            "Wrong",
-            wrong
-        )
-
-    with col4:
-
-        st.metric(
-            "Accuracy",
-            f"{accuracy}%"
-        )
-
-    render_html(
-        """
-        <div class="section-title">
-            📈 Learning Activity
-        </div>
-        """
-    )
-
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
 
     with c1:
-
-        st.metric(
-            "Flashcards Reviewed",
-            st.session_state.flashcards_reviewed
-        )
+        st.metric("Questions attempted", attempted)
 
     with c2:
-
-        st.metric(
-            "Study Time",
-            f"{st.session_state.study_minutes} min"
-        )
+        st.metric("Flashcards reviewed", st.session_state.flashcards_reviewed)
 
     with c3:
+        st.metric("Study time", f"{st.session_state.study_minutes} min")
 
-        st.metric(
-            "Topics",
-            len(st.session_state.topics)
-        )
+    with c4:
+        st.metric("Day streak", f"🔥 {st.session_state.study_streak}")
 
     if attempted > 0:
-
-        st.progress(
-            accuracy / 100
-        )
-
-        st.write(
-            f"### Overall Quiz Accuracy: {accuracy}%"
-        )
-
         if accuracy >= 80:
-
-            st.success(
-                "Excellent performance! Keep going. 🏆"
-            )
-
+            st.success("Excellent performance. Keep going. 🏆")
         elif accuracy >= 60:
-
-            st.info(
-                "Good progress. Keep practicing. 💪"
-            )
-
+            st.info("Good progress. Keep practicing. 💪")
         else:
-
-            st.warning(
-                "Review your material and try another quiz. 📚"
-            )
-
+            st.warning("Review your material and try another quiz. 📚")
     else:
+        st.info("Complete a quiz to start tracking your performance.")
 
-        st.info(
-            "Complete a quiz to start tracking your performance."
+    section_title("Session summary")
+
+    with st.container(border=True):
+        st.write(
+            f"**Current document:** "
+            f"{st.session_state.file_name or 'No document uploaded'}"
         )
-
-    render_html(
-        """
-        <div class="section-title">
-            📊 Study Summary
-        </div>
-        """
-    )
-
-    st.write(
-        f"**Current document:** "
-        f"{st.session_state.file_name or 'No document uploaded'}"
-    )
-
-    st.write(
-        f"**Study chunks:** "
-        f"{len(st.session_state.chunks)}"
-    )
-
-    st.write(
-        f"**Generated topics:** "
-        f"{len(st.session_state.topics)}"
-    )
-
-    st.write(
-        f"**Generated flashcards:** "
-        f"{len(st.session_state.flashcards)}"
-    )
+        st.write(f"**Study chunks:** {len(st.session_state.chunks)}")
+        st.write(f"**Generated topics:** {len(st.session_state.topics)}")
+        st.write(f"**Generated flashcards:** {len(st.session_state.flashcards)}")
 
 
 # ============================================================
@@ -3272,155 +2640,91 @@ def render_progress():
 # ============================================================
 
 def render_ai_chat():
-
-    render_html(
-        """
-        <div class="section-title">
-            💬 AI Study Chat
-        </div>
-        """
-    )
+    section_title("💬 Ask your document")
 
     if not st.session_state.document_loaded:
-
-        st.info(
-            "Upload a PDF first to start asking questions."
-        )
-
+        st.info("Upload a PDF first, then ask questions about it here.")
         return
 
-    for message in (
-        st.session_state.messages
-    ):
-
-        role = message.get(
-            "role",
-            "assistant"
-        )
-
-        content = message.get(
-            "content",
-            ""
-        )
+    for message in st.session_state.messages:
+        role = message.get("role", "assistant")
+        content = message.get("content", "")
 
         with st.chat_message(role):
-
             st.write(content)
 
-    question = st.chat_input(
-        "Ask something from your document..."
-    )
+    question = st.chat_input("Ask something from your document...")
 
     if question:
-
-        st.session_state.messages.append(
-            {
-                "role": "user",
-                "content": question,
-            }
-        )
+        st.session_state.messages.append({"role": "user", "content": question})
 
         with st.chat_message("user"):
-
             st.write(question)
 
         with st.chat_message("assistant"):
-
-            with st.spinner(
-                "AI is thinking..."
-            ):
-
+            with st.spinner("Thinking..."):
                 try:
-
-                    answer = answer_question(
-                        st.session_state.chunks,
-                        question,
-                    )
-
+                    answer = answer_question(st.session_state.chunks, question)
                 except Exception as exc:
-
                     answer = (
-                        "I could not generate an answer "
-                        "right now.\n\n"
+                        "I couldn't answer that right now.\n\n"
                         f"Error: {exc}"
                     )
 
                 st.write(answer)
 
-        st.session_state.messages.append(
-            {
-                "role": "assistant",
-                "content": answer,
-            }
-        )
+        st.session_state.messages.append({"role": "assistant", "content": answer})
 
-
-
-
-common_css()
 
 # ============================================================
 # APPLICATION ROUTING
 # ============================================================
 
+common_css()
+
 if not st.session_state.logged_in:
-
     st.session_state.page = "login"
-
     render_login()
 
 else:
-
     if st.session_state.page == "login":
-
         st.session_state.page = "landing"
         st.rerun()
 
     elif st.session_state.page == "landing":
-
         render_landing()
 
     else:
-
         render_sidebar()
 
-        if st.session_state.page == "home":
+        page = st.session_state.page
 
+        if page == "home":
             render_dashboard()
-
             st.divider()
-
             render_ai_chat()
 
-        elif st.session_state.page == "topics":
-
+        elif page == "topics":
             render_topics()
 
-        elif st.session_state.page == "summary":
+        elif page == "summary":
+            render_summary()
 
-         render_summary()
-         
-        elif st.session_state.page == "quiz":
-
+        elif page == "quiz":
             render_quiz()
 
-        elif st.session_state.page == "flashcards":
-
+        elif page == "flashcards":
             render_flashcards()
 
-        elif st.session_state.page == "planner":
-
+        elif page == "planner":
             render_planner()
 
-        elif st.session_state.page == "adaptive":
-
+        elif page == "adaptive":
             render_adaptive()
 
-        elif st.session_state.page == "progress":
-
+        elif page == "progress":
             render_progress()
 
         else:
-
             st.session_state.page = "home"
             st.rerun()
