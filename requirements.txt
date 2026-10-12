@@ -10,3 +10,4 @@ mistralai
 plotly
 SpeechRecognition
 openai
+streamlit-mic-recorder
