@@ -18,6 +18,8 @@ from utils.text_chuncker import chunk_text
 
 from services.rag_pipeline import answer_question
 from utils.llm import ask_llm
+from utils.voice_input import transcribe_audio
+from streamlit_mic_recorder import mic_recorder
 
 
 # ============================================================
@@ -2646,6 +2648,7 @@ def render_ai_chat():
         st.info("Upload a PDF first, then ask questions about it here.")
         return
 
+    # Display existing conversation
     for message in st.session_state.messages:
         role = message.get("role", "assistant")
         content = message.get("content", "")
@@ -2653,10 +2656,44 @@ def render_ai_chat():
         with st.chat_message(role):
             st.write(content)
 
-    question = st.chat_input("Ask something from your document...")
+    # Voice input
+    st.markdown("#### 🎤 Ask by Voice")
+
+    audio = mic_recorder(
+        start_prompt="🎙️ Start Recording",
+        stop_prompt="⏹️ Stop Recording",
+        key="voice_question_recorder",
+        format="wav",
+    )
+
+    # Convert recorded audio to text
+    voice_question = ""
+
+    if audio and audio.get("bytes"):
+        audio_bytes = audio["bytes"]
+
+        with st.spinner("Converting speech to text..."):
+            voice_question, error = transcribe_audio(audio_bytes)
+
+        if error:
+            st.warning(error)
+
+        elif voice_question:
+            st.success("Voice recognized successfully!")
+            st.write(f"**Your question:** {voice_question}")
+
+    # Existing text input
+    typed_question = st.chat_input(
+        "Ask something from your document..."
+    )
+
+    # Prefer a newly typed question; otherwise use voice input
+    question = typed_question or voice_question
 
     if question:
-        st.session_state.messages.append({"role": "user", "content": question})
+        st.session_state.messages.append(
+            {"role": "user", "content": question}
+        )
 
         with st.chat_message("user"):
             st.write(question)
@@ -2664,7 +2701,11 @@ def render_ai_chat():
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
                 try:
-                    answer = answer_question(st.session_state.chunks, question)
+                    answer = answer_question(
+                        st.session_state.chunks,
+                        question
+                    )
+
                 except Exception as exc:
                     answer = (
                         "I couldn't answer that right now.\n\n"
@@ -2673,7 +2714,9 @@ def render_ai_chat():
 
                 st.write(answer)
 
-        st.session_state.messages.append({"role": "assistant", "content": answer})
+        st.session_state.messages.append(
+            {"role": "assistant", "content": answer}
+        )
 
 
 # ============================================================
